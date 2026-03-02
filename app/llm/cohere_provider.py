@@ -11,7 +11,7 @@ class CohereProvider:
         if not api_key:
             raise RuntimeError("Manca COHERE_API_KEY (o CO_API_KEY)")
 
-        # timeout più alto (puoi metterlo da env COHERE_TIMEOUT)
+        # Higher timeout (can be set via COHERE_TIMEOUT env var)
         t = float(os.getenv("COHERE_TIMEOUT", "120"))
         timeout = httpx.Timeout(t, connect=30.0, read=t, write=30.0, pool=30.0)
         self._httpx_client = httpx.Client(timeout=timeout)

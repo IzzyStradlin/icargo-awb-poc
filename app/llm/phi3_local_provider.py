@@ -25,7 +25,7 @@ def _extract_json_object(text: str) -> str:
     markdown_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', s, re.S)
     if markdown_match:
         json_str = markdown_match.group(1).strip()
-        # Se il JSON è incompleto (no closing brace), aggiungilo
+        # If JSON is incomplete (no closing brace), add it
         if json_str.count('{') > json_str.count('}'):
             json_str += '}' * (json_str.count('{') - json_str.count('}'))
         return json_str
@@ -262,7 +262,7 @@ class Phi3LocalProvider:
             return [[]]
 
         ocr_ids = self.tokenizer.encode(ocr_text)
-        # Se OCR è troppo lungo, limita a 300 token massimo
+        # If OCR is too long, limit to 300 tokens maximum
         if len(ocr_ids) > 300:
             ocr_ids = ocr_ids[:300]
         
@@ -305,7 +305,7 @@ class Phi3LocalProvider:
                 if available_for_chunk > 0:
                     all_ids = prefix_list + chunk_list[:available_for_chunk]
                 else:
-                    # Anche il prompt è troppo lungo, riduci quello
+                    # Prompt is also too long, reduce that
                     all_ids = prefix_list[:max_input]
             
             # Crea i parameters
@@ -342,7 +342,7 @@ class Phi3LocalProvider:
             
         except Exception as e:
             error_msg = str(e)
-            # Se è un shape/broadcast error, ritorna vuoto
+            # If it's a shape/broadcast error, return empty
             if any(x in error_msg.lower() for x in ["shape", "broadcast", "dimension"]):
                 return {}
             # Altrimenti re-raise per debugging

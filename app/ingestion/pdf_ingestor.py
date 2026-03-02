@@ -3,7 +3,7 @@ from typing import BinaryIO, Union
 from pathlib import Path
 
 class PDFIngestor:
-    """Gestisce l'input di file PDF da path o stream."""
+    """Handles PDF file input from path or stream."""
 
     def from_path(self, path: Union[str, Path]) -> bytes:
         p = Path(path)

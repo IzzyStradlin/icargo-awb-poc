@@ -51,7 +51,7 @@ class AwbExtractor:
         candidates = self._extract_awb_candidates(text)
         out.awb_candidates = candidates
 
-        # pick first candidate as default (UI potrà far scegliere)
+        # Pick first candidate as default (UI can allow user to choose)
         if candidates:
             out.awb_number = candidates[0]
             out.awb_prefix, out.awb_serial = candidates[0].split("-")
