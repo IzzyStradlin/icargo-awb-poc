@@ -47,31 +47,32 @@ def _build_prompt_prefix() -> str:
     return (
         "Extract Air Waybill (AWB) fields from OCR text. Return ONLY valid JSON.\n\n"
         "IMPORTANT RULES:\n"
-        "1. Extract ONLY these fields: shipper, consignee, goods_description, agent, flight_number, flight_date\n"
-        "2. For other fields (awb_number, origin, destination, pieces, weight): ALWAYS return null\n"
-        "3. IGNORE boilerplate/legal text (e.g., 'SHIPMENT MAY BE', 'SUBJECT TO', 'CONDITIONS', 'CARRIED VIA', etc)\n"
-        "4. If a value contains legal/boilerplate words, return null instead\n"
-        "5. Extract ONLY actual company/person names, not legal text\n\n"
-        "Field Extraction:\n"
-        "- shipper: Company/person name from 'SHIPPER:', 'FROM:', or sender section (NOT legal text)\n"
-        "- consignee: Company/person name from 'CONSIGNEE:', 'TO:', or receiver section\n"
-        "- goods_description: Cargo contents like 'WIRELESS ROUTER', 'DOCUMENTS', etc\n"
-        "- agent: Airline/handling company name (company suffix: Ltd, Inc, Corp, etc)\n"
-        "- flight_number: Airline flight code like 'AZ123', 'BA456', 'CP125'\n"
-        "- flight_date: Date in any format\n\n"
-        "Return null for any field you cannot find or that is legal text.\n\n"
+        "INSTRUCTIONS:\n"
+        "1. Extract ONLY: shipper, consignee, goods_description, agent, flight_number, flight_date\n"
+        "2. Other fields (awb_number, origin, destination, pieces, weight): ALWAYS null\n"
+        "3. CRITICAL: Return values EXACTLY AS THEY APPEAR in text. Do NOT filter, interpret, or filter.\n"
+        "4. Return null only if field is completely MISSING from document.\n"
+        "5. Ignore boilerplate (conditions, legal text) - extract actual data only.\n\n"
+        "FIELD PATTERNS (high priority):\n"
+        "shipper: First company name after 'Shipper' or 'FROM' section. Example: 'DSV S.P.A.'\n"
+        "consignee: First company name after 'Consignee' or 'TO' section. Example: 'DSV AIR AND SEA LTD'\n"
+        "goods_description: Text describing cargo. Example: 'Consolidation as per attached list'\n"
+        "agent: Company handling shipment. Example: 'ALISCARGO AIRLINES' or 'DSV SPA'\n"
+        "flight_number: Airline code+number. Example: 'CP125', 'BA456' (2 letters + digits, no spaces)\n"
+        "flight_date: Date any format. Example: '01-Oct-23' or '2023-10-01'\n\n"
+        "Return null only if field MISSING.\n\n"
         "{\n"
         '  "awb_number": null,\n'
         '  "origin": null,\n'
         '  "destination": null,\n'
         '  "pieces": null,\n'
         '  "weight": null,\n'
-        '  "shipper": null,\n'
-        '  "consignee": null,\n'
-        '  "agent": null,\n'
-        '  "goods_description": null,\n'
-        '  "flight_number": null,\n'
-        '  "flight_date": null\n'
+        '  "shipper": "EXTRACT_HERE_or_null",\n'
+        '  "consignee": "EXTRACT_HERE_or_null",\n'
+        '  "agent": "EXTRACT_HERE_or_null",\n'
+        '  "goods_description": "EXTRACT_HERE_or_null",\n'
+        '  "flight_number": "EXTRACT_HERE_or_null",\n'
+        '  "flight_date": "EXTRACT_HERE_or_null"\n'
         "}\n\n"
         "OCR Text:\n"
     )
@@ -125,9 +126,8 @@ def _normalize_field_value(key: str, val: Any) -> Any:
         if v == "" or v.lower() == "null":
             return None
         
-        # Filtra testo legale per shipper/agent/consignee
-        if key in ("shipper", "agent", "consignee") and _is_boilerplate(v):
-            return None
+        # Don't filter shipper/agent/consignee based on boilerplate - let them through
+        # The rule-based system will validate them
         
         if key in ("origin", "destination"):
             return v.upper()
