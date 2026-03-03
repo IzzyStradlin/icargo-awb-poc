@@ -43,38 +43,90 @@ def _extract_json_object(text: str) -> str:
 
 
 def _build_prompt_prefix() -> str:
-    # ✅ Prompt ottimizzato: LLM si concentra su campi testuali difficili
+    # Enhanced prompt with AWB domain knowledge and few-shot examples for Phi3
     return (
-        "Extract Air Waybill (AWB) fields from OCR text. Return ONLY valid JSON.\n\n"
-        "IMPORTANT RULES:\n"
-        "INSTRUCTIONS:\n"
-        "1. Extract ONLY: shipper, consignee, goods_description, agent, flight_number, flight_date\n"
-        "2. Other fields (awb_number, origin, destination, pieces, weight): ALWAYS null\n"
-        "3. CRITICAL: Return values EXACTLY AS THEY APPEAR in text. Do NOT filter, interpret, or filter.\n"
-        "4. Return null only if field is completely MISSING from document.\n"
-        "5. Ignore boilerplate (conditions, legal text) - extract actual data only.\n\n"
-        "FIELD PATTERNS (high priority):\n"
-        "shipper: First company name after 'Shipper' or 'FROM' section. Example: 'DSV S.P.A.'\n"
-        "consignee: First company name after 'Consignee' or 'TO' section. Example: 'DSV AIR AND SEA LTD'\n"
-        "goods_description: Text describing cargo. Example: 'Consolidation as per attached list'\n"
-        "agent: Company handling shipment. Example: 'ALISCARGO AIRLINES' or 'DSV SPA'\n"
-        "flight_number: Airline code+number. Example: 'CP125', 'BA456' (2 letters + digits, no spaces)\n"
-        "flight_date: Date any format. Example: '01-Oct-23' or '2023-10-01'\n\n"
-        "Return null only if field MISSING.\n\n"
+        "=== AIR WAYBILL (AWB) EXTRACTION TASK ===\n\n"
+        
+        "BACKGROUND:\n"
+        "An Air Waybill is an international shipping document for air cargo. It contains sender info,\n"
+        "receiver info, cargo description, and flight details. You are extracting key fields.\n\n"
+        
+        "YOUR JOB: Extract ONLY text fields - numbers are handled separately:\n"
+        "1. shipper - Company/person SENDING cargo (Shipper's Name section)\n"
+        "2. consignee - Company/person RECEIVING cargo (Consignee's Name section)\n"
+        "3. agent - Freight handler/airline managing shipment\n"
+        "4. goods_description - What cargo is being shipped\n"
+        "5. flight_number - Airline flight code (e.g., CP125, BA456)\n"
+        "6. flight_date - Flight departure date in any format\n\n"
+        
+        "Return null for: awb_number, origin, destination, pieces, weight (always null)\n\n"
+        
+        "EXTRACTION RULES:\n"
+        "✓ Extract text EXACTLY as it appears (no interpretation)\n"
+        "✓ Return null ONLY if field is completely missing\n"
+        "✓ Include full company suffixes: SPA, Ltd, Inc, Airlines, Corp\n"
+        "✓ Ignore legal boilerplate (conditions, disclaimers)\n"
+        "✓ Never extract MSC AIR CARGO, ALISCARGO as consignee (they're carriers)\n\n"
+        
+        "FIELD-BY-FIELD GUIDE:\n"
+        "\nSHIPPER:\n"
+        "  • Location: 'Shipper's Name and Address' section (top-left)\n"
+        "  • Extract: Company name on FIRST LINE (not address lines below)\n"
+        "  • Could have 'Issued by' line - extract SHIPPER not issuer\n"
+        "  • Examples: 'DSV S.P.A.', 'ACME CORP', 'XYZ TRADING LTD'\n"
+        "\nCONSIGNEE:\n"
+        "  • Location: 'Consignee's Name and Address' section (right side)\n"
+        "  • Extract: Company name on FIRST LINE (not address lines)\n"
+        "  • RULE: Never extract carrier names (MSC AIR CARGO, ALISCARGO, etc)\n"
+        "  • Examples: 'RECEIVER INC', 'DSV AIR AND SEA LTD', 'ACME IMPORT'\n"
+        "\nAGENT:\n"
+        "  • Location: Often near 'Agent' label or company info section\n"
+        "  • Extract: Company name (often ends with Airlines, SPA, Ltd, Inc)\n"
+        "  • This is the HANDLER, not the shipper or receiver\n"
+        "  • Examples: 'ALISCARGO AIRLINES', 'DSV SPA', 'DHL AIR LTD'\n"
+        "\nGOODS_DESCRIPTION:\n"
+        "  • Location: 'Cargo', 'Contents', or 'Description' section (middle)\n"
+        "  • Extract: Commodity/cargo description text\n"
+        "  • Look for 'SAID TO CONTAIN', 'CONSOLIDATION', 'Contents:'\n"
+        "  • Examples: 'Wireless Router', 'Documents', 'Consolidation as per list'\n"
+        "\nFLIGHT_NUMBER:\n"
+        "  • Location: Flight section, routing info\n"
+        "  • Format: 2 LETTERS (airline) + DIGITS (number), NO SPACES\n"
+        "  • Examples: 'CP125', 'BA456', 'AF789'\n"
+        "\nFLIGHT_DATE:\n"
+        "  • Location: Next to flight number, after '/'\n"
+        "  • Accept any date format\n"
+        "  • Examples: '16', '01-Oct-23', '2023-10-01'\n\n"
+        
+        "EXAMPLE EXTRACTION:\n"
+        "Input text:\n"
+        "  'Shipper's Name: DSV S.P.A. Via Dante Milan'\n"
+        "  'Consignee's Name: DSV AIR AND SEA LTD Geneva'\n"
+        "  'Consolidation as per attached list SAID TO CONTAIN ELECTRONICS'\n"
+        "  'Flight: CP125/16'\n"
+        "\nOutput JSON:\n"
+        "  shipper=\"DSV S.P.A.\"\n"
+        "  consignee=\"DSV AIR AND SEA LTD\"\n"
+        "  goods_description=\"Consolidation as per attached list\"\n"
+        "  flight_number=\"CP125\"\n"
+        "  flight_date=\"16\"\n"
+        "  agent=null (or company if found)\n\n"
+        
+        "OUTPUT FORMAT (must be valid JSON):\n"
         "{\n"
         '  "awb_number": null,\n'
         '  "origin": null,\n'
         '  "destination": null,\n'
         '  "pieces": null,\n'
         '  "weight": null,\n'
-        '  "shipper": "EXTRACT_HERE_or_null",\n'
-        '  "consignee": "EXTRACT_HERE_or_null",\n'
-        '  "agent": "EXTRACT_HERE_or_null",\n'
-        '  "goods_description": "EXTRACT_HERE_or_null",\n'
-        '  "flight_number": "EXTRACT_HERE_or_null",\n'
-        '  "flight_date": "EXTRACT_HERE_or_null"\n'
-        "}\n\n"
-        "OCR Text:\n"
+        '  "shipper": "EXTRACT_or_null",\n'
+        '  "consignee": "EXTRACT_or_null",\n'
+        '  "agent": "EXTRACT_or_null",\n'
+        '  "goods_description": "EXTRACT_or_null",\n'
+        '  "flight_number": "EXTRACT_or_null",\n'
+        '  "flight_date": "EXTRACT_or_null"\n'
+        '}\n\n'
+        "OCR TEXT TO EXTRACT FROM:\n"
     )
 
 
