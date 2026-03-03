@@ -215,6 +215,125 @@ API documentation: `http://localhost:8080/docs`
 
 ---
 
+## Managing Credentials & External Integrations
+
+### Why `.env` is NOT in Git
+
+The `.env` file contains secrets (API keys, usernames, passwords) and is listed in `.gitignore` for security:
+- GitHub scans for exposed secrets and blocks pushes containing them
+- If committed, credentials could be compromised even if deleted later
+- Proper practice: secrets in local `.env`, never in version control
+
+### Local Setup for External Integrations
+
+#### Step 1: Create Local `.env` File
+
+```bash
+# Copy the template
+cp .env.example .env
+
+# Edit with your credentials
+nano .env  # or use any text editor
+```
+
+#### Step 2: Configure Each Integration
+
+**Cohere LLM (Optional - only if using cloud LLM)**
+```env
+COHERE_API_KEY=sk-xxxxxxxxxxxx
+COHERE_TIMEOUT=30
+```
+- Get key from: https://dashboard.cohere.ai/
+- Only needed if you select "Cohere (Cloud)" in Streamlit UI
+- Phi3 (Local) requires **no API key**
+
+**iCargo IBS (Optional - only if comparing with enterprise system)**
+```env
+ICARGO_BASE_URL=https://mac-stag-icargo.ibsplc.aero
+ICARGO_USERNAME=your_username
+ICARGO_PASSWORD=your_password
+ICARGO_TIMEOUT=15
+```
+- Contact iCargo admin for credentials
+- Only needed to fetch data for comparison
+- PDF extraction works without it
+
+#### Step 3: Verify Setup
+
+```bash
+# Test that Python can load .env
+python -c "from dotenv import load_dotenv; import os; load_dotenv(); print('✅ .env loaded')"
+
+# Check which LLM will be used
+python -c "from dotenv import load_dotenv; import os; load_dotenv(); print(os.getenv('COHERE_API_KEY') and 'Cohere available' or 'Using Phi3 (local)')"
+```
+
+### Integration Availability
+
+| Feature | Required | Notes |
+|---------|----------|-------|
+| **PDF Extraction** | None | Always works (no dependencies) |
+| **OCR** | Optional | Install Tesseract for better results |
+| **Phi3 LLM** | None | Quantized model, CPU-only, auto-downloads |
+| **Cohere LLM** | COHERE_API_KEY | Cloud-based, requires subscription |
+| **iCargo Comparison** | ICARGO_* credentials | Enterprise integration, optional |
+
+### Minimal Setup (PDF-Only Mode)
+
+If you only need to extract AWB data from PDFs without external systems:
+
+```env
+# .env can be empty or minimal
+# The app will:
+# - Use Phi3 (local) for LLM (no key needed)
+# - Skip iCargo integration
+# - Skip Cohere fallback
+```
+
+Then just run:
+```bash
+streamlit run app/ui/web_streamlit.py
+```
+
+### Full Setup (All Integrations)
+
+For complete functionality:
+
+```env
+COHERE_API_KEY=sk-xxxx...           # For cloud LLM option
+COHERE_TIMEOUT=30
+
+ICARGO_BASE_URL=https://...         # For system comparison
+ICARGO_USERNAME=your_user
+ICARGO_PASSWORD=your_pass
+ICARGO_TIMEOUT=15
+```
+
+### Troubleshooting Missing Credentials
+
+If you see errors like:
+- `"ICARGO_USERNAME / ICARGO_PASSWORD missing"` → iCargo integration unavailable, but PDF extraction still works
+- `"Cohere API invalid"` → Will fall back to Phi3 (local)
+- No specific errors → All integrations working ✅
+
+### For CI/CD and Production
+
+In CI/CD pipelines (GitHub Actions, Docker, etc.):
+- Never add `.env` to git
+- Instead, use GitHub Secrets or environment-specific config
+- Pass credentials as environment variables at runtime
+- Each environment (dev, staging, prod) has different credentials
+
+**Example for GitHub Actions:**
+```yaml
+env:
+  COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+  ICARGO_USERNAME: ${{ secrets.ICARGO_USERNAME }}
+  ICARGO_PASSWORD: ${{ secrets.ICARGO_PASSWORD }}
+```
+
+---
+
 ## Usage Guide
 
 ### Streamlit Web Interface
