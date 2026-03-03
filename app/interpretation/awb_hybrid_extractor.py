@@ -85,20 +85,24 @@ class AwbHybridExtractor:
         result["shipper"] = rule_data.get("shipper") or llm_data.get("shipper")
         result["agent"] = rule_data.get("agent") or llm_data.get("agent")
         
-        # Consignee: prefer LLM. If rule-based equals shipper, skip rule-based (likely error).
+        # Consignee: complex logic - reject rule-based if it matches shipper
+        # If LLM returns something different, use it. Otherwise fallback to rule-based if valid.
         rule_consignee = rule_data.get("consignee")
         llm_consignee = llm_data.get("consignee")
         shipper = rule_data.get("shipper")
         
-        # If rule-based consignee equals shipper, it's likely an extraction error → use LLM only
+        # If rule-based consignee equals shipper, don't use rule-based (extraction error)
         if rule_consignee and shipper and rule_consignee.upper() == shipper.upper():
+            # Rule-based matched shipper (bad), prefer LLM
             result["consignee"] = llm_consignee
         else:
-            # Otherwise prefer LLM, fallback to rule-based
+            # Rule-based is different from shipper (good) OR shipper is None
+            # Use LLM if available, fallback to rule-based if LLM is NULL
             result["consignee"] = llm_consignee or rule_consignee
         
-        # Text fields: prefer LLM for semantic accuracy, fallback to rule-based
-        result["goods_description"] = llm_data.get("goods_description") or rule_data.get("goods_description")
+        # Text fields: prefer rule-based first (it's more reliable), fallback to LLM
+        # goods_description: prefer rule-based patterns, then LLM
+        result["goods_description"] = rule_data.get("goods_description") or llm_data.get("goods_description")
         
         # Flight info: prefer rule-based (pattern extraction is reliable), fallback to LLM
         result["flight_number"] = rule_data.get("flight_number") or llm_data.get("flight_number")
