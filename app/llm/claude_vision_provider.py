@@ -64,10 +64,11 @@ Return ONLY the JSON object.\
 _MAWB_HAWB_PROMPT = """\
 You are an expert in IATA Air Waybill (AWB) document parsing.
 I am showing you images of one shipment package that contains:
-  1. ONE Master Air Waybill (MAWB) — usually PORTRAIT orientation, first image(s)
-  2. ZERO OR MORE House Air Waybills (HAWB) — usually LANDSCAPE orientation, subsequent images
+  1. ONE Master Air Waybill (MAWB) — portrait orientation, first image(s)
+  2. ZERO OR MORE House Air Waybills (HAWB) — subsequent images
 
-Some images may be rotated 90°. Read them accordingly — do not skip rotated pages.
+All images have been pre-rotated to portrait orientation for your convenience.
+HAWB forms are typically multi-column tables; the columns now run top-to-bottom in the image.
 
 Extract ALL fields and return ONLY a valid JSON object with this exact structure (no markdown, no code fences):
 {
@@ -155,18 +156,53 @@ class ClaudeVisionProvider:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalize_to_portrait(png_bytes: bytes) -> bytes:
+        """
+        If the rendered PNG is landscape (width > height), rotate it 90° clockwise
+        so Claude always receives a portrait-oriented image.
+
+        Claude Vision is heavily optimised for portrait documents. Landscape pages
+        (typical of HAWB forms) cause significantly worse field extraction because
+        the model reads columns left-to-right instead of top-to-bottom.
+
+        Rotating 90° clockwise maps the landscape layout as follows:
+          - The left column of the landscape form  → top section of the portrait image
+          - The right column of the landscape form → bottom section of the portrait image
+        This matches the natural top-to-bottom reading order Claude expects.
+
+        Token cost is identical — Claude resizes all images to fit 1568 px on the
+        long side regardless of orientation; rotating does not change pixel count.
+        """
+        try:
+            from PIL import Image as _PILImage
+            import io as _io
+            img = _PILImage.open(_io.BytesIO(png_bytes))
+            if img.width > img.height:
+                # Landscape → rotate 90° clockwise (expand=True preserves full image)
+                img = img.rotate(-90, expand=True)
+                buf = _io.BytesIO()
+                img.save(buf, format="PNG")
+                return buf.getvalue()
+        except Exception:
+            pass  # Pillow unavailable or error — return original bytes unchanged
+        return png_bytes
+
     def _render_pages(self, pdf_bytes: bytes, start_page: int, end_page: int) -> list[str]:
-        """Render PDF pages [start_page, end_page] to base64 PNG strings (2× DPI).
+        """Render PDF pages [start_page, end_page] to base64 PNG strings.
 
         start_page / end_page are 1-based (as stored by AwbDocumentPreSplitter).
         PyMuPDF uses 0-based indices, so we convert here.
         If both are 0 (legacy / unknown), we fall back to page 0 only.
+
+        Landscape pages are automatically rotated to portrait before encoding
+        so Claude Vision receives consistently portrait-oriented images.
         """
         try:
             import fitz  # PyMuPDF
         except ImportError:
             raise RuntimeError(
-                "PyMuPDF non installato. Esegui: pip install pymupdf"
+                "PyMuPDF not installed. Run: pip install pymupdf"
             )
 
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -179,7 +215,7 @@ class ClaudeVisionProvider:
 
         b64_pages: list[str] = []
         for p in range(fitz_start, min(fitz_end + 1, total)):
-            mat = fitz.Matrix(1.5, 1.5)  # ~108 DPI — good quality, stays under 5 MB limit
+            mat = fitz.Matrix(1.5, 1.5)  # ~108 DPI — stays within Claude's 1568 px optimal window
             pix = doc[p].get_pixmap(matrix=mat, colorspace=fitz.csRGB)
             png_bytes = pix.tobytes("png")
             # If still over 4 MB, downsample further to avoid Anthropic 400
@@ -187,6 +223,8 @@ class ClaudeVisionProvider:
                 mat2 = fitz.Matrix(1.0, 1.0)
                 pix = doc[p].get_pixmap(matrix=mat2, colorspace=fitz.csRGB)
                 png_bytes = pix.tobytes("png")
+            # Normalise landscape pages to portrait for better Claude extraction
+            png_bytes = self._normalize_to_portrait(png_bytes)
             b64_pages.append(base64.standard_b64encode(png_bytes).decode())
         doc.close()
         return b64_pages

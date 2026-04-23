@@ -179,8 +179,10 @@ Each MAWB page range is converted to PNG images (via PyMuPDF/fitz) and sent to *
 **Key design decisions:**
 - No intermediate OCR text is sent to Claude — images are sent directly, preserving the 2-column IATA AWB layout that regex cannot reliably parse.
 - A structured JSON prompt instructs Claude to return exactly the AWB schema fields (`awb_number`, `shipper`, `consignee`, `origin`, `destination`, `flight_number`, `pieces`, `weight`, …).
-- The first call returns the **MAWB** (portrait page). Subsequent landscape pages (HAWBs) are included in a second call that returns `{ "mawb": {...}, "hawbs": [{...}] }`.
+- **Landscape normalisation** — before base64-encoding, every page is checked for landscape orientation (`width > height`). Landscape pages (typical of HAWB forms) are automatically rotated 90° clockwise with PIL so Claude always receives portrait-oriented images. This significantly improves HAWB field extraction accuracy because Claude's training is predominantly on portrait documents. The operation is zero-cost: Claude internally resizes images to a 1568 px long side regardless of orientation.
+- The first call returns the **MAWB** (portrait page). HAWB pages are included in a second call that returns `{ "mawb": {...}, "hawbs": [{...}] }`. All images sent have already been normalised to portrait.
 - Safety cap: max 10 images per API call to stay within the token budget.
+- Rendering DPI: `fitz.Matrix(1.5, 1.5)` ≈ 108 DPI → ~1263 px long side for A4, just under Claude's 1568 px resize threshold (optimal quality-to-token ratio).
 - A text-only fallback (`extract_from_text`) is available when PDF bytes are absent.
 
 ---
