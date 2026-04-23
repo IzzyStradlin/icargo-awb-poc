@@ -516,9 +516,9 @@ def render_pdf_upload(on_back):
                             st.dataframe(rows, use_container_width=True)
                             mismatches = [r for r in rows if not r["match"]]
                             if not mismatches:
-                                    st.success("✅ No differences found!")
-                                else:
-                                    st.warning(f"⚠️ {len(mismatches)} difference(s)")
+                                st.success("✅ No differences found!")
+                            else:
+                                st.warning(f"⚠️ {len(mismatches)} difference(s)")
                     except Exception as e:
                         st.error(f"iCargo error: {e}")
                 else:
