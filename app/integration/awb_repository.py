@@ -4,8 +4,8 @@ from .icargo_client import ICargoClient
 
 class AwbRepository:
     """
-    Espone operazioni specifiche su AWB.
-    L'API path è un placeholder PoC: adattare ai path iCargo reali.
+    Exposes AWB-specific operations.
+    API path is a PoC placeholder: adapt to the real iCargo paths.
     """
 
     def __init__(self, client: Optional[ICargoClient] = None):

@@ -128,6 +128,24 @@ class AwbFieldDetector:
             data.agent = data.shipper
             confidences.append(AwbFieldConfidence(field="agent", value=data.agent, confidence=0.92))
 
+        # Chargeable weight — labeled extraction (more reliable than generic weight)
+        chargeable_val = self._extract_chargeable_weight(text)
+        if chargeable_val:
+            data.chargeable_weight = chargeable_val
+            confidences.append(AwbFieldConfidence(field="chargeable_weight", value=str(data.chargeable_weight), confidence=0.85))
+
+        # Rate per kg
+        rate_val = self._extract_rate(text)
+        if rate_val:
+            data.rate = rate_val
+            confidences.append(AwbFieldConfidence(field="rate", value=str(data.rate), confidence=0.80))
+
+        # Total charge — from RCP data row
+        total_charge_val = self._extract_total_charge(text)
+        if total_charge_val:
+            data.total_charge = total_charge_val
+            confidences.append(AwbFieldConfidence(field="total_charge", value=str(data.total_charge), confidence=0.85))
+
         # Goods description - from cargo section
         cargo_section = (sections or {}).get('cargo', '')
         goods_val = self._extract_goods_description(cargo_section or text)
@@ -136,6 +154,31 @@ class AwbFieldDetector:
             confidences.append(AwbFieldConfidence(field="goods_description", value=data.goods_description, confidence=0.7))
 
         return AwbExtractionResult(data=data, confidences=confidences, raw_text=text)
+
+
+    def extract_all(
+        self, 
+        texts: List[str], 
+        sections_list: Optional[List[Dict[str, str]]] = None
+    ) -> List[AwbExtractionResult]:
+        """
+        Extract AWB fields from multiple text blocks (e.g., multiple AWBs per PDF).
+        
+        Args:
+            texts: List of text strings (one per AWB document)
+            sections_list: Optional list of section dicts (parallel to texts)
+        
+        Returns:
+            List of AwbExtractionResult, one per input text
+        """
+        results = []
+        sections_list = sections_list or [None] * len(texts)
+        
+        for text, sections in zip(texts, sections_list):
+            result = self.extract(text, sections)
+            results.append(result)
+        
+        return results
 
     def _fallback_sections(self, text: str) -> Dict[str, str]:
         """Create minimal sections from flat text for backward compatibility."""
@@ -216,7 +259,8 @@ class AwbFieldDetector:
         if not origin or not dest:
             iata_matches = []
             for iata in sorted(COMMON_IATA, key=len, reverse=True):
-                for m in re.finditer(r'\b' + iata + r'\b', text, re.IGNORECASE):
+                # Case-SENSITIVE: avoids matching Italian words like "per", "sin", "fra", "mar"
+                for m in re.finditer(r'\b' + iata + r'\b', text):
                     iata_matches.append((m.start(), iata.upper()))
             
             iata_matches.sort(key=lambda x: x[0])
@@ -235,25 +279,34 @@ class AwbFieldDetector:
         return origin, dest
 
     def _extract_pieces(self, text: str, sections: Dict[str, str]) -> Optional[int]:
-        """Extract pieces from text. Handle various OCR formats."""
-        # Try multiple patterns for pieces
+        """Extract pieces from text. Handle various OCR formats and AWB standard locations."""
+        # Try multiple patterns for pieces - AWB standard provides specific locations
         patterns = [
-            r'(\d+)\s*[|/}]?\s*(?:pcs|pieces?|pc\b)',
-            r'No\.\s*Of\s+Pieces[|:\s]+(\d+)',
-            r'(?:Pieces?|PCS)[|:\s]+(\d+)',
-            r'(\d+)\s*P(?:CS|ieces)',
+            # Pattern 1: "No. of Pieces RCP" label (most reliable — the actual column header)
+            r'No\.\s*(?:of\s+)?Pieces?\s*RCP\s*[:\|/}]?\s*(\d+)',
+            # Pattern 2: After generic "No. of Pieces" label
+            r'No\.\s*(?:of\s+)?Pieces?\s*[:\|/}]?\s*(\d+)',
+            # Pattern 3: "Pieces:" or "PCS:" directly — but NOT if followed by "ON" (goods description)
+            r'(?:Number\s+of\s+)?Pieces?[:\|/}]?\s*(\d+)',
+            r'PCS[:\|/}]?\s*(\d+)',
+            # Pattern 4: Number followed by "pc/pcs" — exclude "NNN PCS ON <pallet>" pattern
+            r'(\d+)\s*[|/}]?\s*(?:pc|pcs|pieces)\b(?!\s*ON\b)',
+            # Pattern 5: In manifest/handling section (less reliable)
+            r'(\d+)\s*(?:pieces?|pcs)\s*(?:of|at)',
+            # Pattern 6: Standalone number before "x" (e.g., "2 x 12kg")
+            r'^(\d+)\s*x\s*\d+',
         ]
-        
+
         for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
+            matches = re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
+            for match in matches:
                 try:
                     pieces = int(match.group(1))
-                    if pieces > 0:
+                    if 0 < pieces < 10000:  # Reasonable range: 1 to 9999
                         return pieces
                 except (ValueError, IndexError):
                     continue
-        
+
         return None
 
     def _extract_weight(self, text: str, sections: Dict[str, str]) -> Optional[float]:
@@ -285,33 +338,186 @@ class AwbFieldDetector:
         
         return None
 
-    def _extract_shipper(self, text: str) -> Optional[str]:
-        """Extract shipper from shipper section. Filter out city names and legal text."""
-        # Multiple patterns to catch different formats
-        patterns = [
-            # Pattern 1: "Shipper's Name and Address" label followed by company name
-            r'Shipper[\'s]*\s*(?:Name and Address)?[^\n]*\n+\s*([A-Z][A-Z0-9a-z\s\.&,\-]*?(?:S\.P\.A\.|Ltd|Inc|GmbH|SARL|SA|SRL|LTD|Co\.?|Corp|SPA|Ltd\.|Inc\.|L\.L\.C|LLC))\b',
-            # Pattern 2: Starting from "Shipper" section, capture first line with company suffix
-            r'Shipper[\'s]?[^\n]*\n+\s*([A-Z][A-Za-z0-9\s\.&,\-]{2,}?(?:S\.P\.A|Ltd|Inc|GmbH|SARL|SA|SRL))\s*(?:\n|$)',
+    def _extract_chargeable_weight(self, text: str) -> Optional[float]:
+        """Extract chargeable weight — distinct from gross weight and total charge.
+
+        Primary strategy: parse the AWB table data row (RCP section), which has a
+        fixed column order:  pieces | gross_wt/K | chargeable_wt | rate | total_charge
+        Example row:  "1 806.91/K] ik 2750.0 4.50) 12375.00}"
+
+        Fallback: look for "Chargeable Weight" label (when label is on a clean line).
+        """
+        # --- Strategy 1: RCP data-row parsing (handles split column headers) ---
+        # The row appears right after the "RCP Item No." header line.
+        # Structure: <pieces> <gross>/K<noise> <chargeable> <rate>) <total>}
+        rcp_match = re.search(
+            r'RCP\s*Item\s*No\.?\s*\n\s*'      # "RCP Item No." line
+            r'(\d+)\s+'                          # group(1): pieces
+            r'(\d+[.,]\d+)\s*/\s*[Kk][^\d\n]*'  # group(2): gross_weight/K  + noise
+            r'(\d+[.,]\d+)\s+'                   # group(3): chargeable_weight  ← what we want
+            r'(\d+[.,]\d+)\s*\)\s*'              # group(4): rate
+            r'(\d+[.,]\d+)',                      # group(5): total_charge
+            text,
+        )
+        if rcp_match:
+            try:
+                return float(rcp_match.group(3).replace(',', '.'))
+            except ValueError:
+                pass
+
+        # --- Strategy 2: label-based (clean PDFs / other AWB forms) ---
+        label_patterns = [
+            # Label and value on same line: "Chargeable Weight  2750"
+            r'[Cc]hargeable\s+[Ww](?:eight|t)\b[^\d\n]{0,40}(\d+(?:[.,]\d+)?)',
+            # Label then value on next line
+            r'[Cc]hargeable\s+[Ww](?:eight|t)\b[^\n]*\n\s*(\d+(?:[.,]\d+)?)',
+            # Abbreviated: "Chg Wt" or "ChgWt"
+            r'[Cc]hg\.?\s*[Ww]t\.?[^\d\n]{0,20}(\d+(?:[.,]\d+)?)',
         ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                shipper_text = match.group(1).strip()
-                # Clean up
-                shipper_text = shipper_text.split('\n')[0].strip()
-                # Split on MSC to get only first company
-                if 'MSC' in shipper_text.upper():
-                    shipper_text = shipper_text.split('MSC')[0].strip()
-                
-                # Filter: reject if it's just a city name (MALPENSA, MILANO, etc) or legal text
-                if (shipper_text.upper() not in ['MALPENSA', 'MILANO', 'ROMA', 'LONDON', 'PARIS', 'HONG KONG'] 
-                    and len(shipper_text) > 3 and len(shipper_text) < 100
-                    and not re.search(r'SUBJECT|CONDITIONS|SHIPMENT MAY|AGREED', shipper_text, re.IGNORECASE)):
-                    return shipper_text
-        
+        candidates = []
+        for pattern in label_patterns:
+            for m in re.finditer(pattern, text):
+                try:
+                    val = float(m.group(1).replace(',', '.'))
+                    if val > 0:
+                        candidates.append(val)
+                except ValueError:
+                    continue
+        if not candidates:
+            return None
+        # Prefer smallest candidate (chargeable weight ≤ total charge by definition)
+        candidates.sort()
+        return candidates[0]
+
+    def _extract_total_charge(self, text: str) -> Optional[float]:
+        """Extract total charge from the AWB cargo table.
+
+        Primary: parse the RCP data row (last number on the row, ends with '}').
+        Fallback: look for repeating total-line (e.g. "806.91  12375.00}").
+        """
+        # Strategy 1: RCP data-row — total_charge is group(5)
+        rcp_match = re.search(
+            r'RCP\s*Item\s*No\.?\s*\n\s*'
+            r'\d+\s+'
+            r'\d+[.,]\d+\s*/\s*[Kk][^\d\n]*'
+            r'\d+[.,]\d+\s+'
+            r'\d+[.,]\d+\s*\)\s*'
+            r'(\d+[.,]\d+)',                  # group(1): total_charge
+            text,
+        )
+        if rcp_match:
+            try:
+                return float(rcp_match.group(1).replace(',', '.'))
+            except ValueError:
+                pass
+
+        # Strategy 2: subtotal line "806.91  12375.00}" (gross_weight + total on same line)
+        subtotal_match = re.search(
+            r'\d+[.,]\d+\s+(\d{4,}[.,]\d+)\s*\}',
+            text,
+        )
+        if subtotal_match:
+            try:
+                return float(subtotal_match.group(1).replace(',', '.'))
+            except ValueError:
+                pass
+
         return None
+
+    def _extract_rate(self, text: str) -> Optional[float]:
+        """Extract rate/charge per kg from the Rate column."""
+        patterns = [
+            # "Rate/Charge" label then value
+            r'[Rr]ate\s*/\s*[Cc]harge[^\d\n]{0,20}(\d+(?:[.,]\d+)?)',
+            # "Rate" label with value < 1000 (avoid matching AWB numbers)
+            r'\b[Rr]ate\b[^\d\n]{0,20}(\d+(?:[.,]\d+)?)',
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text)
+            if m:
+                try:
+                    val = float(m.group(1).replace(',', '.'))
+                    if 0 < val < 1000:  # Rates per kg are always < 1000
+                        return val
+                except ValueError:
+                    continue
+        return None
+
+    def _extract_shipper(self, text: str) -> Optional[str]:
+        """Extract shipper name from text.
+
+        After the column-split fix in OCR, each column is on its own line, so
+        "CEVA AIR&OCEAN" and "CEVA HONG KONG" are no longer merged.
+
+        Strategy:
+        1. Find the 'Shipper' label line.
+        2. Collect the next 1-3 non-address, non-boilerplate lines as the name.
+        3. Stop when a legal suffix is found (S.P.A., Ltd, …).
+        4. If no label found: return None (LLM fallback will be used).
+        """
+        CARRIER_KEYWORDS = {
+            'MSC AIR', 'ALISCARGO', 'LUFTHANSA', 'AIR FRANCE', 'KLM',
+            'BRITISH AIRWAYS', 'UNITED AIRLINES', 'DELTA', 'CATHAY PACIFIC',
+            'EMIRATES', 'CARGOLUX', 'KOREAN AIR', 'SINGAPORE AIRLINES',
+            'JAPAN AIRLINES', 'QANTAS', 'IBERIA', 'SWISS', 'TURKISH AIRLINES',
+            'ETIHAD',
+        }
+
+        # Match "Shipper" label — allow optional apostrophe+s, optional "Name and Address"
+        m = re.search(
+            r'(?:^|[\n])[ \t]*Shipper[\'s]*[ \t]*(?:Name[ \t]+and[ \t]+Address)?[^\n]*\n',
+            text, re.IGNORECASE
+        )
+        if not m:
+            return None
+
+        after = text[m.end():]
+        raw_lines = after.split('\n')
+
+        # Lines to skip: street/postal/boilerplate
+        _SKIP = re.compile(
+            r'^(?:VIA |STRADA |CORSO |PIAZZA |P\.?O\.?\s*BOX|TEL|FAX|'
+            r'SUBJECT|CONDITIONS|AGREED|ISSUED\s+BY|AIR\s+WAYBILL|NOT\s+NEGOTIABLE|'
+            r'AIRPORT|HANDLING|FIRST\s+CARRIER|\d{4,})',
+            re.IGNORECASE
+        )
+
+        name_lines: List[str] = []
+        for line in raw_lines[:8]:
+            line = line.strip()
+            if not line:
+                if name_lines:
+                    break   # blank line ends the name block
+                continue
+            if _SKIP.match(line):
+                break
+            # Stop if this line is clearly a consignee label (column-split artefact guard)
+            if re.match(r'Consignee', line, re.IGNORECASE):
+                break
+            name_lines.append(line)
+            # Stop after a line that ends with a legal suffix
+            if re.search(
+                r'\b(?:S\.P\.A\.?|S\.R\.L\.?|Ltd\.?|Inc\.?|GmbH|LLC|SRL|SPA|Corp)\b',
+                line, re.IGNORECASE
+            ):
+                break
+
+        if not name_lines:
+            return None
+
+        shipper_text = ' '.join(name_lines).strip()
+        shipper_upper = shipper_text.upper()
+
+        for carrier in CARRIER_KEYWORDS:
+            if carrier in shipper_upper:
+                return None
+
+        if (shipper_upper in {'MALPENSA', 'MILANO', 'ROMA', 'LONDON', 'PARIS', 'HONG KONG'}
+                or len(shipper_text) < 4 or len(shipper_text) > 120
+                or re.search(r'SUBJECT|CONDITIONS|SHIPMENT MAY|AGREED', shipper_text, re.IGNORECASE)):
+            return None
+
+        return shipper_text
 
     def _extract_consignee(self, text: str, shipper: Optional[str] = None) -> Optional[str]:
         """Extract consignee from consignee section. Must NOT be carrier/agent or shipper."""
@@ -348,29 +554,64 @@ class AwbFieldDetector:
         return None
 
     def _extract_flight_number(self, text: str) -> Optional[str]:
-        """Extract flight number. Handle OCR distortion with irregular spacing."""
+        """Extract flight number from AWB. Handle OCR distortion and various locations."""
+        # AWB standard: Flight appears in "Requested Flight/Date" section
+        # Format: AIRLINE_CODE + FLIGHT_NUMBER (e.g., CP137, AZ456, BA123)
+
         patterns = [
-            # Standard: "CP125", "AZ123"
-            r'(?:flight|flt|handling)\s*(?:no\.?|number|#|code)?\s*[:=]?\s*([A-Z]{2}\d{1,4})',
-            # With slash: "CP125/16"
-            r'([A-Z]{2}\d{1,4})/\d{1,2}',
-            # From handling information section
-            r'Handling\s+Information[^\n]*\n?[^\n]*([A-Z]{2}\d{1,4})',
-            # OCR distorted: "CP1 37/19" → extract "CP137"
-            r'([A-Z]{2})\s*(\d)[\s}]*(\d)\s*(\d)',
+            # Pattern 0 (HIGHEST PRIORITY): Spatially-reconstructed routing annotation.
+            # pdf_text_extractor appends "ROUTING: {TO} {CARRIER} {FLIGHT}/{DATE} ..."
+            # for native PDFs, bypassing the column-linearisation garbling.
+            # Example: "ROUTING: HKG CP 113/19 EUR PPX NVD NCV"
+            #          → carrier=CP, flight=113 → "CP113"
+            r'ROUTING:\s+[A-Z]{2,3}\s+([A-Z]{2})\s+(\d{2,5})(?:/\d{1,2})?',
+
+            # Pattern 1: "Requested Flight/Date" label — most reliable IATA AWB location
+            r'Requested\s+Fl(?:ight|t)\.?\s*[/\\]?\s*Date[^\n]*\n?\s*([A-Z]{2}\s*\d{1,5})',
+
+            # Pattern 2: "Flight/Date" or "Flight:" label
+            r'(?:Flt|Flight)[./\s]*Date[^\n]*[:=]?\s*([A-Z]{2}\s*\d{1,5})',
+            r'(?:Flt|Flight)[^\n]*[:=]?\s*([A-Z]{2}\s*\d{1,5})',
+
+            # Pattern 3: Code with slash date suffix (e.g., "CP137/16" or "CP0137/19")
+            r'([A-Z]{2}\s*\d{1,5})\s*/\s*\d{1,2}(?:\s|$)',
+
+            # Pattern 4: In "Handling Information" section
+            r'Handling\s+Information[^\n]*(?:\n[^\n]*){0,5}?([A-Z]{2}\d{1,5})',
+
+            # Pattern 5: Fallback generic — 2-letter code + 2-5 digits, preceded by whitespace/newline
+            r'(?:^|\s|[\n:\|])([A-Z]{2}\d{2,5})(?:\s|[\n:/]|$)',
+
+            # Pattern 6: OCR distorted with spaces between characters (e.g., "C P 1 3 7")
+            r'([A-Z])\s+([A-Z])\s+(\d)\s+(\d)\s+(\d)',
         ]
-        
+
         for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                if len(match.groups()) == 4:
-                    # OCR distorted format: groups = (letter+letter, digit, digit, digit)
-                    flight = match.group(1) + match.group(2) + match.group(3) + match.group(4)
-                    return flight.upper().strip()
-                else:
-                    flight_str = match.group(1).upper()
-                    return flight_str.split('/')[0] if '/' in flight_str else flight_str
-        
+            matches = re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
+            for match in matches:
+                try:
+                    groups = match.groups()
+
+                    # Pattern 0: two groups → carrier code + flight number
+                    if len(groups) == 2 and groups[1] is not None:
+                        flight_str = (groups[0].replace(' ', '') + groups[1].replace(' ', '')).upper()
+                        if re.match(r'^[A-Z]{2}\d{2,5}$', flight_str):
+                            return flight_str
+
+                    # Pattern 6: reassemble spaced characters
+                    if len(groups) == 5 and all(g is not None for g in groups):
+                        flight = ''.join(g.upper() for g in groups)
+                        if re.match(r'^[A-Z]{2}\d{3}$', flight):
+                            return flight
+
+                    # Standard patterns: flight is first group — strip internal spaces
+                    flight_str = groups[0].replace(' ', '').upper()
+                    if re.match(r'^[A-Z]{2}\d{2,5}$', flight_str):
+                        return flight_str
+
+                except (ValueError, IndexError, AttributeError):
+                    continue
+
         return None
 
     def _extract_flight_date(self, text: str) -> Optional[str]:
@@ -501,7 +742,7 @@ class AwbFieldDetector:
             data.weight = float(wt_str)
             confidences.append(AwbFieldConfidence(field="weight", value=str(data.weight), confidence=0.9))
 
-        # Shipper: Estrai da sezione "Shipper's Name and Address", evita testo legale
+        # Shipper: Extract from "Shipper's Name and Address" section, avoid legal text
         shipper_match = re.search(
             r'Shipper(?:\'?s)?\s*(?:Name and)?[^:]*?(?:Address|Account)?[^\n]*\n+'
             r'(?!lt is|It is|SUBJECT)' # Negative lookahead for legal text
@@ -518,8 +759,8 @@ class AwbFieldDetector:
             if data.shipper:
                 confidences.append(AwbFieldConfidence(field="shipper", value=data.shipper, confidence=0.92))
         
-        # Consignee: Estrai da sezione "Consignee's Name and Address", evita testo legale
-        # Pattern: Cerca company name (con suffisso) dopo il label, prima di testo legale
+        # Consignee: Extract from "Consignee's Name and Address" section, avoid legal text
+        # Pattern: Look for company name (with suffix) after the label, before legal text
         consignee_match = re.search(
             r'Consignee(?:\'?s)?\s*(?:Name and)?[^:]*?(?:Address)?[^\n]*\n+'
             r'(?:[^\n]*\n)*?' # Skip some lines that might be legal text
@@ -585,7 +826,7 @@ class AwbFieldDetector:
             data.agent = data.shipper
             confidences.append(AwbFieldConfidence(field="agent", value=data.agent, confidence=0.92))
 
-        # Goods description: Cerca "CONSOLIDATED", "LITHIUM", nature of goods, evita testo legale
+        # Goods description: Look for "CONSOLIDATED", "LITHIUM", nature of goods, avoid legal text
         goods_match = re.search(
             r'(?:SAID TO CONTAIN|Consolidation|CONTENTS|GOODS|Nature of Goods|Nature and Quantity)\s*\n?'
             r'(?:.*?\n)*?' # Skip some lines

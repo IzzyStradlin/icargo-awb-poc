@@ -111,6 +111,9 @@ def map_extracted_awb_llm(extracted: Dict[str, Any]) -> Dict[str, Any]:
 
     out["pieces"] = _int_from_any(_pick(extracted, "pieces", "stated_pieces", "statedPieces"))
     out["weight"] = _num_from_any(_pick(extracted, "weight", "stated_weight", "statedWeight"))
+    out["chargeable_weight"] = _num_from_any(_pick(extracted, "chargeable_weight", "chargeableWeight"))
+    out["rate"] = _num_from_any(_pick(extracted, "rate", "rate_charge", "rateCharge"))
+    out["total_charge"] = _num_from_any(_pick(extracted, "total_charge", "totalCharge", "total"))
 
     out["goods_description"] = _norm_str(_pick(
         extracted,
@@ -156,6 +159,9 @@ def map_icargo_awb_ibs(icargo_awb: Dict[str, Any]) -> Dict[str, Any]:
 
     out["pieces"] = _int_from_any(pick("stated_pieces", "statedPieces", "pieces", "pieceCount"))
     out["weight"] = _num_from_any(pick("stated_weight", "statedWeight", "weight", "grossWeight"))
+    out["chargeable_weight"] = _num_from_any(pick("chargeable_weight", "chargeableWeight", "chargeableWt"))
+    out["rate"] = _num_from_any(pick("rate", "rate_charge", "rateCharge", "ratePerKg"))
+    out["total_charge"] = _num_from_any(pick("total_charge", "totalCharge", "total", "totalCharges"))
 
     out["goods_description"] = _norm_str(
         pick("shipment_description", "shipmentDescription", "goods_description", "goodsDescription")
@@ -198,6 +204,9 @@ def diff_awb(extracted_flat: Dict[str, Any], icargo_flat: Dict[str, Any]) -> Lis
         "agent",
         "pieces",
         "weight",
+        "chargeable_weight",
+        "rate",
+        "total_charge",
         "goods_description",
         "shipper",
         "consignee",
@@ -209,11 +218,14 @@ def diff_awb(extracted_flat: Dict[str, Any], icargo_flat: Dict[str, Any]) -> Lis
     for f in fields:
         a = extracted_flat.get(f)
         b = icargo_flat.get(f)
-        match = _float_equal(a, b, tol=0.01) if f == "weight" else (a == b)
+        if f in ("weight", "chargeable_weight", "rate", "total_charge"):
+            match = _float_equal(a, b, tol=0.01)
+        else:
+            match = (a == b)
         rows.append({
             "field": f,
-            "pdf_llm": str(a) if a is not None else None,  # Converti a stringa per Arrow compatibility
-            "icargo": str(b) if b is not None else None,   # Converti a stringa per Arrow compatibility
+            "pdf_llm": str(a) if a is not None else None,  # Convert to string for Arrow compatibility
+            "icargo": str(b) if b is not None else None,   # Convert to string for Arrow compatibility
             "match": match
         })
 

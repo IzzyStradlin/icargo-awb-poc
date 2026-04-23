@@ -14,3 +14,16 @@ class AwbNormalizer:
         if data.awb_serial:
             data.awb_serial = "".join(filter(str.isdigit, data.awb_serial))[:8]
         return data
+
+    def normalize_batch(self, results: list) -> list:
+        """
+        Normalize multiple AwbData objects.
+        
+        Args:
+            results: List of AwbData to normalize
+        
+        Returns:
+            List of normalized AwbData
+        """
+        return [self.normalize(data) for data in results]
+

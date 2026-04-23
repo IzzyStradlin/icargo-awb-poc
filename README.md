@@ -105,8 +105,101 @@ icargo-awb-poc/
 │   └── unit/
 │       ├── test_awb_diff_engine.py     # Diff calculation tests
 │       └── test_awb_field_detector.py  # Rule-based extraction tests
+├── test_presplitter.py                  # Presplitter testing & analysis
 ├── requirements.txt                     # Python dependencies
 └── README.md                            # This file
+```
+
+---
+
+## Document Pre-Splitting Strategy (New)
+
+### Problem Solved
+
+When processing PDF files with **multiple Master AWBs (MAWBs) + House AWBs (HAWBs)**, the old approach extracted ALL text first, then tried to split it. This caused:
+- OCR contamination between documents (errors bleeding into adjacent documents)
+- Difficulty identifying exact document boundaries
+- Loss of structural information about page/document relationships
+
+### Solution: Pre-Split Before OCR
+
+The new **AwbDocumentPreSplitter** reverses the order:
+
+1. **Read PDF page-by-page** (native text extraction)
+2. **Identify MAWB markers** per page (with fuzzy tolerance for OCR variations)
+3. **Group pages** into logical document ranges
+4. **Extract text** separately for each document range
+5. **Process independently** - no cross-contamination
+
+### How It Works
+
+**Master AWB Identification (with fuzzy matching):**
+```
+Primary marker: "Not Negotiable Air Waybill Issued by"
+Fallback markers: "Not negotiable Air Waybill", "AIR WAYBILL ISSUED BY", etc.
+
+Fuzzy tolerance: 85% (handles OCR character errors like: l→1, O→0, etc.)
+```
+
+**Document Grouping:**
+```
+Document 1: Pages 1-3 (MAWB 233-12345678 + HAWBs)
+Document 2: Pages 4-6 (MAWB 233-87654321 + HAWBs)
+Document 3: Pages 7-8 (MAWB 233-11111111 + HAWBs)
+```
+
+### Usage
+
+**In Pipeline (Recommended):**
+```python
+from app.pipelines.run_from_pdf import run
+
+# Uses presplitter by default (new behavior)
+result = run(pdf_path="/path/to/multidoc.pdf", use_presplitter=True)
+
+# Falls back to old approach if needed
+result = run(pdf_path="/path/to/multidoc.pdf", use_presplitter=False)
+```
+
+**Direct Module Usage:**
+```python
+from app.extraction.awb_document_presplitter import AwbDocumentPreSplitter
+from app.extraction.pdf_text_extractor import PDFTextExtractor
+from app.ingestion.pdf_ingestor import PDFIngestor
+
+# Initialize
+raw_pdf = PDFIngestor().from_path("multidoc.pdf")
+extractor = PDFTextExtractor()
+presplitter = AwbDocumentPreSplitter(extractor=extractor)
+
+# Get document ranges with text
+documents = presplitter.presplit_pdf_with_text(raw_pdf, use_extractor=True)
+
+# Each document is independent
+for doc in documents:
+    print(f"Pages {doc['start_page']}-{doc['end_page']}: AWB {doc['awb_number']}")
+    print(f"Text ({len(doc['text'])} chars):\n{doc['text'][:200]}")
+```
+
+**Testing & Analysis:**
+```bash
+python -m test_presplitter /path/to/multidoc.pdf
+```
+
+This will:
+- Identify document ranges
+- Show fuzzy match results for MAWB markers
+- Extract AWB numbers per document
+- Display text preview and statistics
+
+### Configuration
+
+Adjust fuzzy matching tolerance in `awb_document_presplitter.py`:
+```python
+FUZZY_TOLERANCE = 0.85  # 0.80-0.90 typically good
+
+# Lower (0.80) = more permissive (catches OCR errors but may false-positive)
+# Higher (0.95) = stricter (fewer false-positives but misses some corrupted markers)
 ```
 
 ---

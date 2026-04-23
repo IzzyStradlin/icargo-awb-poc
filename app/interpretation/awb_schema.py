@@ -6,12 +6,18 @@ class AwbData(BaseModel):
     awb_prefix: Optional[str] = Field(None, description="IATA 3-digit prefix")
     awb_serial: Optional[str] = Field(None, description="8-digit serial")
     shipper: Optional[str] = None
+    shipper_address: Optional[str] = None  # Full address of shipper
     consignee: Optional[str] = None
+    consignee_address: Optional[str] = None  # Full address of consignee
     agent: Optional[str] = None  # Client/customer (often same as shipper)
+    agent_address: Optional[str] = None  # Full address of issuing agent
     origin: Optional[str] = None
     destination: Optional[str] = None
     pieces: Optional[int] = None
-    weight: Optional[float] = None
+    weight: Optional[float] = None  # Gross weight in kg
+    chargeable_weight: Optional[float] = None  # Chargeable weight in kg (for billing)
+    rate: Optional[float] = None          # Rate/Charge per kg
+    total_charge: Optional[float] = None  # Total charges = chargeable_weight * rate
     goods_description: Optional[str] = None
     flight_no: Optional[str] = None
     flight_date: Optional[str] = None  # ISO date in PoC

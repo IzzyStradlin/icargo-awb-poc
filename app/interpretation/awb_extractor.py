@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
 
 
-AWB_REGEX = re.compile(r"\b(\d{3})\s*[-]?\s*(\d{8})\b")  # 001-33412551 (anche con spazi)
+AWB_REGEX = re.compile(r"\b(\d{3})\s*[-]?\s*(\d{8})\b")  # 001-33412551 (also with spaces)
 IATA3_REGEX = re.compile(r"\b([A-Z]{3})\b")
 
 
@@ -143,11 +143,11 @@ class AwbExtractor:
         return None
 
     def _extract_party(self, text: str, label: str) -> Optional[str]:
-        # prende la riga successiva a "SHIPPER:" / "CONSIGNEE:"
-        # PoC: stop alla fine riga
+        # takes the line following "SHIPPER:" / "CONSIGNEE:"
+        # PoC: stop at end of line
         m = re.search(rf"\b{label}\b[:\s]+(.+)", text, re.I)
         if m:
             line = m.group(1).strip()
-            # taglia se molto lunga
+            # truncate if very long
             return line[:200]
         return None

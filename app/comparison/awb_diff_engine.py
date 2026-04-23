@@ -8,7 +8,7 @@ class DiffItem(TypedDict):
     match: bool
 
 class AwbDiffEngine:
-    """Confronta i campi estratti dal documento con quelli iCargo."""
+    """Compares fields extracted from the document with those from iCargo."""
 
     def diff(self, extracted: Dict[str, Any], system: Dict[str, Any]) -> List[DiffItem]:
         fields = [

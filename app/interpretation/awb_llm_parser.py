@@ -11,7 +11,7 @@ JSON_BLOCK = re.compile(r"\{.*\}", re.S)
 class AwbParsed:
     data: Dict[str, Any]
     awb_number: Optional[str]
-    raw: str  # <-- aggiunto per debug
+    raw: str  # <-- added for debug
 
 def parse_llm_json(raw: str) -> AwbParsed:
     s = (raw or "").strip()
@@ -23,7 +23,7 @@ def parse_llm_json(raw: str) -> AwbParsed:
     try:
         obj = json.loads(s)
     except Exception as e:
-        # rilancia mantenendo raw per debug UI
+        # re-raise keeping raw for debug UI
         raise ValueError(f"JSON parse error: {e}\nRAW:\n{s[:1500]}") from e
 
     awb = obj.get("awb_number")
