@@ -325,6 +325,12 @@ class ClaudeVisionProvider:
         The first page(s) are the MAWB (typically portrait).
         Subsequent pages are HAWBs (orientation corrected automatically).
 
+        KNOWN LIMITATION: all pages are sent in a single API call with
+        max_tokens=8192. Documents with many HAWBs can produce responses
+        that exceed this limit, causing JSON truncation. See ARCHITECTURE.md
+        section 4.3 ("Known Limitations & Planned Improvements") for the
+        proposed multi-call solution.
+
         Parameters
         ----------
         pdf_bytes      : raw bytes of the full PDF
