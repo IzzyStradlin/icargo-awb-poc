@@ -417,4 +417,36 @@ CMD ["python", "-m", "app.main"]
 
 ---
 
+## 12. Known Limitations & Planned Improvements
+
+### 12.1 Claude output truncation on high-HAWB documents
+
+**Current behaviour**  
+`extract_mawb_with_hawbs_json` sends all pages of a document (MAWB + all HAWBs) in a **single API call** with `max_tokens=8192`. When a consolidation contains many House AWBs the generated JSON can exceed this token budget. Claude truncates the response mid-JSON, producing a parse error such as:
+
+```
+JSON parse error: Expecting ',' delimiter: line 641 column 6 (char 21178)
+```
+
+**Root cause**  
+Each HAWB object in the response contains ~25 fields. At ~15–20 tokens per field the token cost per HAWB is roughly **400–500 tokens**. With `max_tokens=8192` the practical ceiling is approximately **15–18 HAWBs** before truncation risk increases significantly.
+
+**Proposed solution (pending business input)**  
+Split the extraction into multiple focused API calls:
+
+| Call | Pages sent | Prompt | `max_tokens` | Purpose |
+|------|-----------|--------|-------------|---------|
+| 1 | MAWB pages (first 1–2) | `_EXTRACTION_PROMPT` | 2 048 | Extract MAWB fields only |
+| 2 | HAWBs 1–N (first batch) | `_HAWB_ONLY_PROMPT` (returns JSON array) | 4 096 | Extract first batch of HAWBs |
+| 3…K | HAWBs N+1–M (next batches) | `_HAWB_ONLY_PROMPT` | 4 096 | Extract remaining batches |
+
+Results from all calls are merged in Python before returning `{ "mawb": {...}, "hawbs": [...] }`.
+
+**Open question for business**  
+> What is the maximum number of House AWBs that can appear under a single MAWB in real operations?
+
+The answer determines the batch size (HAWBs per call) and whether a fixed batch of 4 or 5 per call is sufficient, or whether a larger/dynamic batch is needed. Once confirmed, implementation in `ClaudeVisionProvider.extract_mawb_with_hawbs_json` is straightforward — the architecture is already designed to support it.
+
+---
+
 *Document generated: April 2026 — MSC Air Cargo / iCargo PoC Team*
