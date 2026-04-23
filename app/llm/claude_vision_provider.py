@@ -156,47 +156,31 @@ class ClaudeVisionProvider:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _normalize_to_portrait(png_bytes: bytes) -> bytes:
-        """
-        If the rendered PNG is landscape (width > height), rotate it 90° clockwise
-        so Claude always receives a portrait-oriented image.
-
-        Claude Vision is heavily optimised for portrait documents. Landscape pages
-        (typical of HAWB forms) cause significantly worse field extraction because
-        the model reads columns left-to-right instead of top-to-bottom.
-
-        Rotating 90° clockwise maps the landscape layout as follows:
-          - The left column of the landscape form  → top section of the portrait image
-          - The right column of the landscape form → bottom section of the portrait image
-        This matches the natural top-to-bottom reading order Claude expects.
-
-        Token cost is identical — Claude resizes all images to fit 1568 px on the
-        long side regardless of orientation; rotating does not change pixel count.
-        """
-        try:
-            from PIL import Image as _PILImage
-            import io as _io
-            img = _PILImage.open(_io.BytesIO(png_bytes))
-            if img.width > img.height:
-                # Landscape → rotate 90° clockwise (expand=True preserves full image)
-                img = img.rotate(-90, expand=True)
-                buf = _io.BytesIO()
-                img.save(buf, format="PNG")
-                return buf.getvalue()
-        except Exception:
-            pass  # Pillow unavailable or error — return original bytes unchanged
-        return png_bytes
-
-    def _render_pages(self, pdf_bytes: bytes, start_page: int, end_page: int) -> list[str]:
+    def _render_pages(
+        self,
+        pdf_bytes: bytes,
+        start_page: int,
+        end_page: int,
+        page_rotations: Optional[dict] = None,
+    ) -> list[str]:
         """Render PDF pages [start_page, end_page] to base64 PNG strings.
 
         start_page / end_page are 1-based (as stored by AwbDocumentPreSplitter).
         PyMuPDF uses 0-based indices, so we convert here.
         If both are 0 (legacy / unknown), we fall back to page 0 only.
 
-        Landscape pages are automatically rotated to portrait before encoding
-        so Claude Vision receives consistently portrait-oriented images.
+        Orientation is corrected before encoding so Claude always receives
+        upright images regardless of how the scans were stored:
+
+          1. OSD-based (preferred): if `page_rotations` is provided by the
+             presplitter (Tesseract --psm 0 on every scanned page), that value
+             is used as the CCW correction angle.
+          2. Landscape heuristic (fallback): if `page_rotations` has no entry
+             for a page, and page.bound() shows width > height, rotate 90° CCW.
+             This handles scanned PDFs where OSD is not available.
+
+        `page_rotations` maps 1-based page numbers → CCW degrees (0/90/180/270).
+        Pages absent from the dict are assumed upright (0°).
         """
         try:
             import fitz  # PyMuPDF
@@ -213,18 +197,36 @@ class ClaudeVisionProvider:
         fitz_start = max(0, start_page - 1) if start_page > 0 else 0
         fitz_end = max(0, end_page - 1) if end_page > 0 else fitz_start
 
+        rotations = page_rotations or {}
+
         b64_pages: list[str] = []
         for p in range(fitz_start, min(fitz_end + 1, total)):
-            mat = fitz.Matrix(1.5, 1.5)  # ~108 DPI — stays within Claude's 1568 px optimal window
-            pix = doc[p].get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+            page = doc[p]
+            page_num_1based = p + 1  # match presplitter convention
+
+            # Determine correction angle (CCW degrees for fitz.Matrix.prerotate)
+            if page_num_1based in rotations:
+                # Tesseract OSD told us exactly how much to rotate
+                correction = rotations[page_num_1based]
+            else:
+                # Fallback heuristic: landscape → assume 90° CW scan, correct CCW
+                rect = page.bound()  # accounts for PDF /Rotate flag
+                correction = 90 if rect.width > rect.height else 0
+
+            if correction != 0:
+                mat = fitz.Matrix(1.5, 1.5).prerotate(correction)
+            else:
+                mat = fitz.Matrix(1.5, 1.5)  # ~108 DPI — within Claude's 1568 px window
+
+            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
             png_bytes = pix.tobytes("png")
-            # If still over 4 MB, downsample further to avoid Anthropic 400
+
+            # If still over 4 MB, downsample to avoid Anthropic 400
             if len(png_bytes) > 4 * 1024 * 1024:
-                mat2 = fitz.Matrix(1.0, 1.0)
-                pix = doc[p].get_pixmap(matrix=mat2, colorspace=fitz.csRGB)
+                mat2 = fitz.Matrix(1.0, 1.0).prerotate(correction) if correction != 0 else fitz.Matrix(1.0, 1.0)
+                pix = page.get_pixmap(matrix=mat2, colorspace=fitz.csRGB)
                 png_bytes = pix.tobytes("png")
-            # Normalise landscape pages to portrait for better Claude extraction
-            png_bytes = self._normalize_to_portrait(png_bytes)
+
             b64_pages.append(base64.standard_b64encode(png_bytes).decode())
         doc.close()
         return b64_pages
@@ -270,6 +272,7 @@ class ClaudeVisionProvider:
         pdf_bytes: bytes,
         start_page: int = 0,
         end_page: int = 0,
+        page_rotations: Optional[dict] = None,
     ) -> str:
         """
         Send PDF page images to Claude Vision and return a raw JSON string
@@ -277,11 +280,14 @@ class ClaudeVisionProvider:
 
         Parameters
         ----------
-        pdf_bytes  : raw bytes of the full PDF
-        start_page : 0-based first page of this AWB (inclusive)
-        end_page   : 0-based last  page of this AWB (inclusive)
+        pdf_bytes      : raw bytes of the full PDF
+        start_page     : 1-based first page of this AWB (inclusive)
+        end_page       : 1-based last  page of this AWB (inclusive)
+        page_rotations : per-page CCW rotation angles from Tesseract OSD
+                         (1-based page_num → degrees). If absent, falls back
+                         to landscape heuristic.
         """
-        b64_images = self._render_pages(pdf_bytes, start_page, end_page)
+        b64_images = self._render_pages(pdf_bytes, start_page, end_page, page_rotations)
         if not b64_images:
             raise ValueError(
                 f"No pages found in range {start_page}-{end_page}"
@@ -309,6 +315,7 @@ class ClaudeVisionProvider:
         start_page: int = 0,
         end_page: int = 0,
         max_images: int = 10,
+        page_rotations: Optional[dict] = None,
     ) -> str:
         """
         Send all pages of a MAWB block (including any HAWB pages that follow)
@@ -316,16 +323,19 @@ class ClaudeVisionProvider:
           { "mawb": {...}, "hawbs": [{...}, ...] }
 
         The first page(s) are the MAWB (typically portrait).
-        Subsequent pages are HAWBs (typically landscape — Claude reads them natively).
+        Subsequent pages are HAWBs (orientation corrected automatically).
 
         Parameters
         ----------
-        pdf_bytes  : raw bytes of the full PDF
-        start_page : 1-based first page (presplitter convention)
-        end_page   : 1-based last page  (presplitter convention)
-        max_images : safety cap — never send more than this many images per call
+        pdf_bytes      : raw bytes of the full PDF
+        start_page     : 1-based first page (presplitter convention)
+        end_page       : 1-based last page  (presplitter convention)
+        max_images     : safety cap — never send more than this many images per call
+        page_rotations : per-page CCW rotation angles from Tesseract OSD
+                         (1-based page_num → degrees). If absent, falls back
+                         to landscape heuristic.
         """
-        b64_images = self._render_pages(pdf_bytes, start_page, end_page)
+        b64_images = self._render_pages(pdf_bytes, start_page, end_page, page_rotations)
         if not b64_images:
             raise ValueError(
                 f"No pages found in range {start_page}-{end_page}"

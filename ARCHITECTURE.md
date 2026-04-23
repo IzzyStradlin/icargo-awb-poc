@@ -161,12 +161,16 @@ Multi-AWB PDFs (e.g. a batch of scanned MAWBs from an airline) are split into in
 3. **MAWB phrase markers** — `"Not Negotiable Air Waybill Issued by"` and variants, tolerance 0.85.
 4. **AWB number clustering** — extract all AWB numbers per page and cluster by 3-digit prefix.
 
-**Two OCR modes:**
+**Two OCR modes (boundary detection):**
 
 | Mode     | DPI  | Page area | Execution  | Use case                           |
 |----------|------|-----------|------------|------------------------------------|
 | Smart    | 300  | Top 20 %  | Parallel   | Recommended — high AWB# accuracy on poor scans, small crop keeps it fast |
 | Normal   | 200  | Full page | Sequential | Difficult/rotated scans, worst-case fallback |
+
+**Orientation detection (Smart mode — runs in the same parallel pass):**
+
+For every scanned page, a second Tesseract task runs `--psm 0` (OSD) on the **full** rendered image alongside the boundary-detection OCR. OSD detects the rotation of the scan (0°, 90°, 180°, or 270°) and stores the correction angle in `page_rotations` within the document dict. This is the primary input for orientation correction in the Claude Vision render step.
 
 > **Why 300 DPI / 20%?** On any IATA AWB form the AWB number and the "Shipper's Name and Address" label (the primary split marker) always appear in the top 12–15 % of the page. A 20% crop adds a safe margin. 300 DPI is needed to reliably OCR small printed digits (e.g. `233-10166763`) on low-quality scans — lower DPI is the primary cause of missed AWB numbers. Running in parallel on just the top 20% keeps total wall-clock time well below the full-page sequential mode.
 
@@ -179,7 +183,8 @@ Each MAWB page range is converted to PNG images (via PyMuPDF/fitz) and sent to *
 **Key design decisions:**
 - No intermediate OCR text is sent to Claude — images are sent directly, preserving the 2-column IATA AWB layout that regex cannot reliably parse.
 - A structured JSON prompt instructs Claude to return exactly the AWB schema fields (`awb_number`, `shipper`, `consignee`, `origin`, `destination`, `flight_number`, `pieces`, `weight`, …).
-- **Landscape normalisation** — before base64-encoding, every page is checked for landscape orientation (`width > height`). Landscape pages (typical of HAWB forms) are automatically rotated 90° clockwise with PIL so Claude always receives portrait-oriented images. This significantly improves HAWB field extraction accuracy because Claude's training is predominantly on portrait documents. The operation is zero-cost: Claude internally resizes images to a 1568 px long side regardless of orientation.
+- **Landscape normalisation** — before base64-encoding, `page.bound()` (which already accounts for the PDF `/Rotate` flag) is checked for landscape orientation (`width > height`). Landscape pages (typical of HAWB forms stored or scanned rotated 90° clockwise) are re-rendered with `fitz.Matrix(1.5, 1.5).prerotate(90)` — a 90° counter-clockwise correction baked directly into the PyMuPDF render matrix, no PIL dependency. This ensures Claude always receives portrait-oriented images and significantly improves HAWB field extraction accuracy.
+- **OSD-based rotation (full pipeline)** — because scans from warehouses can arrive at any rotation (0°, 90°, 180°, 270°), the presplit phase runs Tesseract OSD (`--psm 0`) on the full image of every scanned page **in parallel** with the existing boundary-detection OCR. The detected correction angle is stored in `page_rotations` (a `dict[page_num → CCW_degrees]` added to each presplit document dict). `ClaudeVisionProvider._render_pages` accepts this dict and applies `Matrix.prerotate(correction)` per page, handling all four rotation cases. The landscape heuristic acts as a fallback for native-text pages or when Tesseract OSD is unavailable.
 - The first call returns the **MAWB** (portrait page). HAWB pages are included in a second call that returns `{ "mawb": {...}, "hawbs": [{...}] }`. All images sent have already been normalised to portrait.
 - Safety cap: max 10 images per API call to stay within the token budget.
 - Rendering DPI: `fitz.Matrix(1.5, 1.5)` ≈ 108 DPI → ~1263 px long side for A4, just under Claude's 1568 px resize threshold (optimal quality-to-token ratio).
@@ -256,11 +261,19 @@ Single-page application with a simple client-side router stored in `st.session_s
 |-----------------------|--------------|------------------------------------------|
 | `raw_pdf_bytes`       | `bytes`      | Current PDF file contents                |
 | `pdf_name`            | `str`        | Uploaded file name (change detector)     |
-| `split_documents`     | `list[dict]` | Pre-split result (page ranges + AWB #)   |
+| `split_documents`     | `list[dict]` | Pre-split result (page ranges, AWB #, `page_rotations`) |
 | `split_mode`          | `str`        | `"fast"` or `"normale"`                  |
 | `awb_results`         | `list[dict]` | Claude Vision extraction results         |
 | `vision_refined_awbs` | `dict`       | Per-AWB re-extraction overrides          |
 | `debug_page_texts`    | `dict`       | Raw page text cache for the debug panel  |
+
+**UI workflow (pdf_upload page):**
+
+1. **Upload** — user drops a PDF; presplit runs automatically.
+2. **🔍 Debug split** *(expander)* — raw page text + document boundaries, useful to verify the split logic without calling Claude.
+3. **🖼 Preview rendered pages** *(expander)* — click **"📦 Build PNG preview ZIP"** to render all pages with orientation correction applied (same pipeline as Claude receives) and download the ZIP. File names include a `_rotN` suffix when a page was rotated (e.g. `page_002_rot90.png`). Use this to verify rotation before spending API credits.
+4. **🚀 Extract all with Claude Vision** — calls Claude for every detected AWB block.
+5. **Results** — MAWB + HAWB fields displayed; re-extract per AWB; download JSON; compare with iCargo.
 
 ---
 
@@ -271,11 +284,24 @@ User uploads PDF
        │
        ▼
 AwbDocumentPreSplitter.presplit_pdf_fast / presplit_pdf_with_text
-  → List[{ awb_number, start_page, end_page, text }]
+  → List[{ awb_number, start_page, end_page, text, page_rotations }]
+  │
+  │  Smart mode runs TWO parallel Tesseract tasks per scanned page:
+  │    • PSM 6  (top 20%)  → boundary-detection text
+  │    • PSM 0 / OSD       → per-page rotation correction angle
+  │  page_rotations: { page_num → CCW_degrees }  (only non-zero entries)
+       │
+       ├──► [optional] 🖼 Preview PNG ZIP (no Claude call)
+       │         renders pages with orientation correction applied
+       │         → user verifies upright images before spending credits
        │
        ▼  (for each document)
-ClaudeVisionProvider.extract_mawb_with_hawbs_json(pdf_bytes, start_page, end_page)
-  → raw JSON string
+ClaudeVisionProvider._render_pages(pdf_bytes, start_page, end_page, page_rotations)
+  │   per page: apply OSD correction → fallback landscape heuristic → no rotation
+  │   → portrait PNG, base64-encoded
+       │
+       ▼
+ClaudeVisionProvider.extract_mawb_with_hawbs_json  → raw JSON string
        │
        ▼
 AwbVisionExtractor.extract_mawb_with_hawbs

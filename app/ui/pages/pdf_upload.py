@@ -383,6 +383,59 @@ def render_pdf_upload(on_back):
 
     st.divider()
 
+    # ── Preview rendered PNGs (rotation-corrected, no Claude call) ─────────
+    with st.expander("🖼 Preview rendered pages (rotation check — no Claude call)", expanded=False):
+        st.caption(
+            "Downloads a ZIP of the PNG images that would be sent to Claude Vision. "
+            "Use this to verify orientation correction before spending API credits."
+        )
+        if st.button("📦 Build PNG preview ZIP", key="build_png_zip"):
+            import io as _zip_io
+            import zipfile as _zipfile
+            try:
+                import fitz as _fitz
+            except ImportError:
+                st.error("PyMuPDF not installed. Run: pip install pymupdf")
+                return
+
+            buf = _zip_io.BytesIO()
+            total_pages = 0
+            with _zipfile.ZipFile(buf, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
+                fitz_doc = _fitz.open(stream=raw_pdf, filetype="pdf")
+                for doc_idx, doc in enumerate(split_docs):
+                    awb_label = doc.get("awb_number") or f"DOC_{doc_idx + 1}"
+                    rotations: dict = doc.get("page_rotations") or {}
+                    s = doc.get("start_page", 1)
+                    e = doc.get("end_page", s)
+                    for page_num_1 in range(s, e + 1):
+                        fitz_idx = page_num_1 - 1
+                        if fitz_idx >= len(fitz_doc):
+                            continue
+                        page = fitz_doc[fitz_idx]
+                        if page_num_1 in rotations:
+                            correction = rotations[page_num_1]
+                        else:
+                            rect = page.bound()
+                            correction = 90 if rect.width > rect.height else 0
+                        mat = _fitz.Matrix(1.5, 1.5).prerotate(correction) if correction else _fitz.Matrix(1.5, 1.5)
+                        pix = page.get_pixmap(matrix=mat, colorspace=_fitz.csRGB)
+                        png_bytes = pix.tobytes("png")
+                        rot_label = f"_rot{correction}" if correction else ""
+                        fname = f"{awb_label}/page_{page_num_1:03d}{rot_label}.png"
+                        zf.writestr(fname, png_bytes)
+                        total_pages += 1
+                fitz_doc.close()
+
+            buf.seek(0)
+            st.download_button(
+                label=f"⬇️ Download {total_pages} PNG(s) as ZIP",
+                data=buf.getvalue(),
+                file_name=f"{uploaded.name.rsplit('.', 1)[0]}_preview.zip",
+                mime="application/zip",
+                key="download_png_zip",
+            )
+            st.success(f"✅ {total_pages} page(s) rendered. Check the ZIP to verify orientation.")
+
     # ── Extract All ────────────────────────────────────────────────────────
     col_extract, col_reset = st.columns([2, 1])
     with col_extract:
@@ -411,6 +464,7 @@ def render_pdf_upload(on_back):
                     raw_pdf,
                     start_page=doc.get("start_page", 1),
                     end_page=doc.get("end_page", doc.get("start_page", 1)),
+                    page_rotations=doc.get("page_rotations"),
                 )
                 # Trust pre-validated AWB number from the splitter
                 if doc.get("awb_number"):
@@ -478,6 +532,7 @@ def render_pdf_upload(on_back):
                                 st.session_state["raw_pdf_bytes"],
                                 start_page=doc.get("start_page", 1),
                                 end_page=doc.get("end_page", doc.get("start_page", 1)),
+                                page_rotations=doc.get("page_rotations"),
                             )
                         else:
                             text = (doc or {}).get("text", "") if doc else ""

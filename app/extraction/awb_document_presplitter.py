@@ -718,6 +718,37 @@ class AwbDocumentPreSplitter:
         except Exception:
             return page_num, ""
 
+    @staticmethod
+    def _detect_rotation_page(page_num: int, img_arr) -> tuple[int, int]:
+        """
+        Detect page orientation using Tesseract OSD (--psm 0) on the full
+        pre-rendered image.
+
+        Returns (page_num, rotate_degrees) where rotate_degrees is the angle
+        in degrees (0 / 90 / 180 / 270) needed to rotate the image
+        counter-clockwise to make the content upright.
+        Convention: Tesseract's `rotate` field = CCW degrees to correct.
+
+        Falls back to (page_num, 0) if OSD is unavailable or fails (e.g. too
+        few characters on the page for reliable detection).
+
+        NOTE: Runs in a worker thread — img_arr must be a plain numpy array
+        (no fitz objects).
+        """
+        try:
+            import pytesseract as _tess
+            from PIL import Image as _PILImage
+            pil_img = _PILImage.fromarray(img_arr)
+            osd = _tess.image_to_osd(
+                pil_img,
+                config="--psm 0 --oem 1",
+                output_type=_tess.Output.DICT,
+            )
+            rotate = int(osd.get("rotate", 0))
+            return page_num, rotate
+        except Exception:
+            return page_num, 0
+
     def presplit_pdf_fast(self, raw_pdf: bytes, max_workers: int = 4) -> List[Dict[str, any]]:
         """
         Fast presplit optimised for scanned PDFs.
@@ -777,16 +808,24 @@ class AwbDocumentPreSplitter:
             finally:
                 fitz_doc.close()
 
-        # ── Step 3: parallel Tesseract OCR on pre-rendered images ──────────
+        # ── Step 3: parallel Tesseract OCR + OSD on pre-rendered images ───
+        # OCR (top 20%, PSM 6) → text for boundary detection
+        # OSD (full image, PSM 0) → per-page rotation correction angle
+        page_rotations: Dict[int, int] = {}
         if page_images:
-            futures = {}
+            ocr_futures: dict = {}
+            osd_futures: dict = {}
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 for page_num, img_arr in page_images.items():
-                    future = pool.submit(self._fast_ocr_page, page_num, img_arr, 0.20)
-                    futures[future] = page_num
-                for future in as_completed(futures):
+                    ocr_futures[pool.submit(self._fast_ocr_page, page_num, img_arr, 0.20)] = page_num
+                    osd_futures[pool.submit(self._detect_rotation_page, page_num, img_arr)] = page_num
+                for future in as_completed(ocr_futures):
                     pn, text = future.result()
                     page_texts[pn] = text
+                for future in as_completed(osd_futures):
+                    pn, rotation = future.result()
+                    if rotation != 0:
+                        page_rotations[pn] = rotation
 
         # ── Step 3: run the standard splitting logic on collected texts ─────
         documents = self._presplit_by_shipper_marker(page_texts)
@@ -828,12 +867,20 @@ class AwbDocumentPreSplitter:
         self._enrich_documents_with_awbs(documents, page_texts)
         documents = self._merge_same_awb_documents(documents)
 
-        # ── Step 4: attach page text to each document range ────────────────
+        # ── Step 5: attach page text and rotation map to each document ────
         for doc in documents:
             doc["text"] = "\n".join(
                 page_texts.get(p, "")
                 for p in range(doc["start_page"], doc["end_page"] + 1)
             )
+            # Per-page rotation corrections (only scanned pages with non-zero rotation).
+            # Key: 1-based page number. Value: CCW degrees to rotate to make content upright.
+            # Pages not present in the dict require no rotation.
+            doc["page_rotations"] = {
+                p: page_rotations[p]
+                for p in range(doc["start_page"], doc["end_page"] + 1)
+                if p in page_rotations
+            }
 
         return documents
 

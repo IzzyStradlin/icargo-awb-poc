@@ -27,12 +27,13 @@ class AwbVisionExtractor:
         pdf_bytes: bytes,
         start_page: int = 0,
         end_page: int = 0,
+        page_rotations: Optional[Dict[int, int]] = None,
     ) -> Dict[str, Any]:
         """
         Send PDF page images to Claude Vision and return a structured dict.
         Returns the flat MAWB-only schema (legacy, single-AWB extraction).
         """
-        raw_json = self._provider.extract_awb_json(pdf_bytes, start_page, end_page)
+        raw_json = self._provider.extract_awb_json(pdf_bytes, start_page, end_page, page_rotations)
         parsed = parse_llm_json(raw_json)
         return parsed.data
 
@@ -41,19 +42,24 @@ class AwbVisionExtractor:
         pdf_bytes: bytes,
         start_page: int = 0,
         end_page: int = 0,
+        page_rotations: Optional[Dict[int, int]] = None,
     ) -> Dict[str, Any]:
         """
-        Send all pages of a MAWB block (portrait MAWB + landscape HAWBs) to
-        Claude Vision and return a structured dict:
+        Send all pages of a MAWB block (MAWB + HAWBs) to Claude Vision and
+        return a structured dict:
           {
             "mawb":  { ...MAWB fields... },
             "hawbs": [ { ...HAWB fields... }, ... ]   # empty list if no HAWBs
           }
 
+        Page orientation is corrected automatically using `page_rotations`
+        (Tesseract OSD output from the presplit phase). Falls back to
+        landscape heuristic if not provided.
+
         Falls back to flat MAWB-only extraction if Claude returns the old format.
         """
         raw_json = self._provider.extract_mawb_with_hawbs_json(
-            pdf_bytes, start_page, end_page
+            pdf_bytes, start_page, end_page, page_rotations=page_rotations
         )
 
         # Try to parse as the new nested format first.
