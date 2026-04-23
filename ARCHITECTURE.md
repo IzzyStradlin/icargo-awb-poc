@@ -46,7 +46,7 @@ This application automates the extraction, validation, and comparison of **Air W
           │            AI Extraction Layer                   │
           │  AwbVisionExtractor → ClaudeVisionProvider      │
           │  • PDF pages rendered to PNG images             │
-          │  • Sent directly to Claude 3.5 Sonnet Vision    │
+          │  • Sent directly to Claude Haiku 4.5 Vision    │
           │  • Returns structured JSON (MAWB + HAWBs)       │
           └──────────────────┬──────────────────────────────┘
                              │
@@ -178,7 +178,7 @@ For every scanned page, a second Tesseract task runs `--psm 0` (OSD) on the **fu
 
 ### 4.3 AI Extraction — `AwbVisionExtractor` + `ClaudeVisionProvider`
 
-Each MAWB page range is converted to PNG images (via PyMuPDF/fitz) and sent to **Claude 3.5 Sonnet Vision** through the Anthropic REST API.
+Each MAWB page range is converted to PNG images (via PyMuPDF/fitz) and sent to **Claude Haiku 4.5** (`claude-haiku-4-5-20251001`, overridable via `CLAUDE_MODEL` env var) through the Anthropic REST API.
 
 **Key design decisions:**
 - No intermediate OCR text is sent to Claude — images are sent directly, preserving the 2-column IATA AWB layout that regex cannot reliably parse.
