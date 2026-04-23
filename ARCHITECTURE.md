@@ -163,10 +163,12 @@ Multi-AWB PDFs (e.g. a batch of scanned MAWBs from an airline) are split into in
 
 **Two OCR modes:**
 
-| Mode     | DPI  | Page area | Execution  | Use case                    |
-|----------|------|-----------|------------|-----------------------------|
-| Fast     | 100  | Top 40 %  | Parallel   | Scanned multi-AWB PDFs      |
-| Normal   | 200  | Full page | Sequential | Complex or small-font forms |
+| Mode     | DPI  | Page area | Execution  | Use case                           |
+|----------|------|-----------|------------|------------------------------------|
+| Smart    | 300  | Top 20 %  | Parallel   | Recommended — high AWB# accuracy on poor scans, small crop keeps it fast |
+| Normal   | 200  | Full page | Sequential | Difficult/rotated scans, worst-case fallback |
+
+> **Why 300 DPI / 20%?** On any IATA AWB form the AWB number and the "Shipper's Name and Address" label (the primary split marker) always appear in the top 12–15 % of the page. A 20% crop adds a safe margin. 300 DPI is needed to reliably OCR small printed digits (e.g. `233-10166763`) on low-quality scans — lower DPI is the primary cause of missed AWB numbers. Running in parallel on just the top 20% keeps total wall-clock time well below the full-page sequential mode.
 
 ---
 

@@ -681,7 +681,7 @@ class AwbDocumentPreSplitter:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _fast_ocr_page(page_num: int, img_arr, top_fraction: float = 0.50) -> tuple[int, str]:
+    def _fast_ocr_page(page_num: int, img_arr, top_fraction: float = 0.20) -> tuple[int, str]:
         """
         OCR a pre-rendered numpy image array using settings optimised for boundary
         detection only (NOT full-quality extraction).
@@ -691,8 +691,10 @@ class AwbDocumentPreSplitter:
         Only the Tesseract call (this function) runs in the worker thread.
 
         Settings:
-        - 150 DPI render (caller's responsibility — good Tesseract quality, faster than 200)
-        - Top `top_fraction` of the image (AWB number + Shipper label are always there)
+        - 300 DPI render (caller's responsibility — high enough to reliably read
+          AWB numbers like 233-10166763 even on poor-quality scans)
+        - Top `top_fraction` of the image (default 20 %: AWB number + Shipper label
+          are always in the top 12-15 % of an IATA AWB form; 20 % adds a safe margin)
         - OEM 1 (LSTM only, ~30 % faster than OEM 3)
         - No OSD / auto-rotation (saves ~0.5-1 s per page)
         - PSM 6 (uniform text block)
@@ -721,13 +723,16 @@ class AwbDocumentPreSplitter:
         Fast presplit optimised for scanned PDFs.
 
         Key differences from the standard path:
-        - 150 DPI rendering (vs 200 DPI) — fewer pixels, still readable for Tesseract
-        - OCR only the top 50 % of each page (Shipper label + AWB# are always there)
-        - OEM 1 / PSM 6 — LSTM only, no OSD rotation detection
+        - 300 DPI rendering — high enough to reliably OCR small AWB number digits
+          even on low-quality scans; 200 DPI still misses digits on poor originals.
+        - OCR only the top 20 % of each page — the IATA AWB header (AWB number,
+          "Shipper's Name and Address", "Not Negotiable…") always lives there.
+        - OEM 1 / PSM 6 — LSTM only, no OSD rotation detection.
         - Parallel Tesseract: pixmaps are rendered sequentially in the main thread
-          (PyMuPDF is NOT thread-safe), then OCR runs concurrently in a thread pool
+          (PyMuPDF is NOT thread-safe), then OCR runs concurrently in a thread pool.
 
-        Typical speedup: 3-5× for scanned PDFs vs the full-quality sequential path.
+        Typical speedup vs normal mode: 3-5×  (small crop + parallelism).
+        Accuracy for AWB number detection: better than normal mode on poor scans.
 
         Returns same structure as presplit_pdf_with_text() (includes 'text' key).
         """
@@ -739,7 +744,7 @@ class AwbDocumentPreSplitter:
             return self.presplit_pdf_with_text(raw_pdf, use_extractor=bool(self.extractor))
 
         MIN_NATIVE_CHARS = 50
-        DPI = 150
+        DPI = 300  # 300 DPI needed to reliably OCR small AWB number digits on poor scans
 
         # ── Step 1: collect native text per page via pdfplumber ────────────
         page_texts: Dict[int, str] = {}
@@ -777,7 +782,7 @@ class AwbDocumentPreSplitter:
             futures = {}
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 for page_num, img_arr in page_images.items():
-                    future = pool.submit(self._fast_ocr_page, page_num, img_arr)
+                    future = pool.submit(self._fast_ocr_page, page_num, img_arr, 0.20)
                     futures[future] = page_num
                 for future in as_completed(futures):
                     pn, text = future.result()

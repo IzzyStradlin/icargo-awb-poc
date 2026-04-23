@@ -287,9 +287,9 @@ def render_pdf_upload(on_back):
         "Pre-split mode",
         options=["fast", "normale"],
         format_func=lambda x: (
-            "⚡ Fast — 100 DPI, top 40% of page, parallel (recommended for scans)"
+            "⚡ Smart — 300 DPI, top 20% of page, parallel (recommended)"
             if x == "fast"
-            else "🔬 Normal — 200 DPI, full page, sequential (more accurate)"
+            else "🔬 Normal — 200 DPI, full page, sequential (for difficult scans)"
         ),
         horizontal=True,
         key="split_mode_radio",
@@ -307,7 +307,7 @@ def render_pdf_upload(on_back):
     # ── Split ──────────────────────────────────────────────────────────────
     use_fast = (st.session_state["split_mode"] == "fast")
     if st.session_state["split_documents"] is None:
-        mode_label = "⚡ fast" if use_fast else "🔬 normal"
+        mode_label = "⚡ smart" if use_fast else "🔬 normal"
         with st.spinner(f"Detecting AWB documents in the PDF ({mode_label})..."):
             try:
                 docs = _split_pdf(raw_pdf, fast=use_fast)
@@ -330,7 +330,7 @@ def render_pdf_upload(on_back):
 
     # ── Debug: raw text + split boundaries ────────────────────────────────
     with st.expander("🔍 Debug split — raw text per page", expanded=False):
-        mode_badge = "⚡ Fast (100 DPI, top 40%)" if use_fast else "🔬 Normal (200 DPI, full page)"
+        mode_badge = "⚡ Smart (300 DPI, top 20%)" if use_fast else "🔬 Normal (200 DPI, full page)"
         st.caption(
             f"Split mode used: **{mode_badge}**. "
             "Text extracted by pdfplumber/Tesseract (before Vision). "
