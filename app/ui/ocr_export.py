@@ -29,7 +29,7 @@ class OcrExporter:
             filename: Original PDF filename
             used_ocr: Whether OCR was used (vs native text extraction)
             total_pages: Number of pages in PDF
-            extraction_method: Method used ("hybrid", "tesseract", "easyocr", "native")
+            extraction_method: Method used ("hybrid", "tesseract", "native")
         """
         self.text = text
         self.filename = filename

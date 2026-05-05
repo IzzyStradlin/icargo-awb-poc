@@ -74,7 +74,7 @@ icargo-awb-poc/
 │   ├── config/
 │   │   └── settings.py                  # Pydantic-based env-var configuration
 │   ├── extraction/
-│   │   ├── pdf_text_extractor.py        # pdfplumber + Tesseract/EasyOCR per-page extractor
+│   │   ├── pdf_text_extractor.py        # pdfplumber + Tesseract per-page extractor
 │   │   ├── email_text_extractor.py      # .eml parser (body + attachments)
 │   │   ├── awb_document_presplitter.py  # Multi-AWB boundary detection engine
 │   │   ├── awb_document_splitter.py     # Legacy single-pass splitter
@@ -82,8 +82,7 @@ icargo-awb-poc/
 │   │   └── awb_section_extractor.py     # Section-level text slicer
 │   ├── ingestion/
 │   │   ├── pdf_ingestor.py              # File-level PDF intake
-│   │   ├── email_ingestor.py            # File-level .eml intake
-│   │   └── enhanced_pdf_ocr.py          # High-quality OCR pipeline (EasyOCR)
+│   │   └── email_ingestor.py            # File-level .eml intake
 │   ├── interpretation/
 │   │   ├── awb_vision_extractor.py      # Main extractor (Claude Vision)
 │   │   ├── awb_llm_extractor.py         # LLM text-based extractor (legacy)
@@ -118,7 +117,6 @@ icargo-awb-poc/
 │   └── ui/
 │       ├── web_streamlit.py             # Streamlit app shell & navigation router
 │       ├── web_fastapi.py               # FastAPI REST endpoints
-│       ├── integration_easyocr.py       # EasyOCR integration helpers
 │       ├── ocr_export.py                # OCR result export utilities
 │       ├── assets/
 │       │   └── branding.py              # MSC brand colours, CSS, logo helpers
@@ -388,7 +386,6 @@ AwbVisionExtractor.extract_mawb_with_hawbs
 |------------|---------------|----------------------------------------|-------------------------------------|
 | Native PDF | pdfplumber    | Extract embedded text (fast, lossless) | Always attempted first              |
 | Tesseract  | pytesseract   | Rasterise → OCR (rule-based)           | When native text < 200 chars/page   |
-| EasyOCR    | easyocr       | Deep-learning OCR (GPU optional)       | Last resort when Tesseract absent   |
 | Claude     | Anthropic API | Vision-based layout understanding      | Always used for structured extraction |
 
 ---
@@ -431,7 +428,6 @@ All runtime settings are loaded from a `.env` file (or process environment) via 
 | pymupdf (fitz)   | ≥ 1.23           | PDF → PNG rasterisation              |
 | pytesseract      | ≥ 0.3            | Tesseract OCR wrapper                |
 | pillow           | ≥ 10             | Image manipulation                   |
-| easyocr          | ≥ 1.7            | Deep-learning OCR (optional)         |
 | pydantic         | ≥ 1.10           | Schema validation & settings         |
 | httpx            | ≥ 0.25           | Async-capable HTTP client            |
 | requests         | ≥ 2.31           | Synchronous HTTP client              |

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import io
 import re
-import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
@@ -33,14 +32,6 @@ try:
 except Exception:
     _TESSERACT_AVAILABLE = False
 
-# EasyOCR — deep-learning OCR, kept as last-resort fallback (~40s/page on CPU)
-try:
-    import easyocr as _easyocr
-    warnings.filterwarnings('ignore')
-    _EASYOCR_AVAILABLE = True
-except Exception:
-    _EASYOCR_AVAILABLE = False
-
 
 @dataclass
 class ExtractOptions:
@@ -49,19 +40,6 @@ class ExtractOptions:
     ocr_dpi: int = 200             # 200 DPI balances speed and accuracy for Tesseract
     min_text_chars: int = 200      # below this per-page → OCR fallback
     max_pages: Optional[int] = None
-
-
-# EasyOCR reader — only loaded if Tesseract is unavailable
-_easyocr_reader: Optional[object] = None
-
-
-def _get_easyocr_reader():
-    global _easyocr_reader
-    if _easyocr_reader is None:
-        if not _EASYOCR_AVAILABLE:
-            raise RuntimeError("Neither pytesseract nor EasyOCR is available.")
-        _easyocr_reader = _easyocr.Reader(['en', 'it'], gpu=False)
-    return _easyocr_reader
 
 
 def _auto_rotate_image(pil_img) -> "_PILImage.Image":
@@ -83,47 +61,14 @@ def _auto_rotate_image(pil_img) -> "_PILImage.Image":
 
 
 def _ocr_page(img_array) -> str:
-    """
-    Run OCR on a numpy uint8 RGB array.
-    Strategy:
-      1. pytesseract  (fast: ~2s/page)  — with automatic orientation correction via OSD
-      2. EasyOCR      (slow: ~40s/page) — only if Tesseract not installed
-    """
-    if _TESSERACT_AVAILABLE:
-        pil_img = _PILImage.fromarray(img_array)
-        # Auto-rotate if the page is landscape or upside-down (OSD detection)
-        pil_img = _auto_rotate_image(pil_img)
-        # PSM 6 = assume uniform block of text (good for AWB forms)
-        # OEM 3 = default engine (LSTM)
-        cfg = "--oem 3 --psm 6"
-        lang = "eng+ita"
-        return _tesseract.image_to_string(pil_img, lang=lang, config=cfg)
-
-    # Fallback: EasyOCR with line-reconstruction
-    reader = _get_easyocr_reader()
-    results = reader.readtext(img_array)
-    lines: List[List[Tuple[float, str]]] = []
-    line_ys: List[float] = []
-    y_tol = 20
-    for bbox, text, conf in results:
-        if conf < 0.3:
-            continue
-        text_x = sum(p[0] for p in bbox) / 4
-        text_y = sum(p[1] for p in bbox) / 4
-        placed = False
-        for i, ln in enumerate(lines):
-            if abs(line_ys[i] - text_y) <= y_tol:
-                ln.append((text_x, text))
-                placed = True
-                break
-        if not placed:
-            lines.append([(text_x, text)])
-            line_ys.append(text_y)
-    sorted_lines = sorted(zip(line_ys, lines), key=lambda p: p[0])
-    return '\n'.join(
-        ' '.join(tok for _, tok in sorted(toks, key=lambda t: t[0]))
-        for _, toks in sorted_lines
-    )
+    """Run pytesseract OCR on a numpy uint8 RGB array with automatic orientation correction."""
+    if not _TESSERACT_AVAILABLE:
+        raise RuntimeError("pytesseract is required for OCR but is not installed.")
+    pil_img = _PILImage.fromarray(img_array)
+    pil_img = _auto_rotate_image(pil_img)
+    cfg = "--oem 3 --psm 6"
+    lang = "eng+ita"
+    return _tesseract.image_to_string(pil_img, lang=lang, config=cfg)
 
 
 class PDFTextExtractor:
@@ -131,7 +76,7 @@ class PDFTextExtractor:
     Per-page hybrid extraction — generator-based for real-time UI progress.
 
     Tier 1 (native): PyMuPDF get_text() — milliseconds per page, no OCR needed
-    Tier 2 (OCR):    pytesseract (~2s/page) → EasyOCR fallback (~40s/page)
+    Tier 2 (OCR):    pytesseract (~2s/page)
 
     OCR only fires on pages where native extraction yields < _PER_PAGE_MIN_CHARS.
     For born-digital PDFs (standard MSC AWBs) OCR never runs.
@@ -145,7 +90,7 @@ class PDFTextExtractor:
     def scan_pages(self, raw_pdf: bytes):
         """
         Generator: yields (page_num, total_pages, page_text, method) per page.
-        method = "native" | "OCR-tesseract" | "OCR-easyocr"
+        method = "native" | "OCR-tesseract"
         """
         import numpy as np
 
@@ -191,7 +136,7 @@ class PDFTextExtractor:
                             pix.height, pix.width, 3
                         )
                         ocr_text = _ocr_page(img)
-                        method = "OCR-tesseract" if _TESSERACT_AVAILABLE else "OCR-easyocr"
+                        method = "OCR-tesseract"
                     else:
                         ocr_text = native  # can't OCR without PyMuPDF
                         method = "native"
