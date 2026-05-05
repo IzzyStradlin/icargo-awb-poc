@@ -174,6 +174,17 @@ For every scanned page, a second Tesseract task runs `--psm 0` (OSD) on the **fu
 
 > **Why 300 DPI / 20%?** On any IATA AWB form the AWB number and the "Shipper's Name and Address" label (the primary split marker) always appear in the top 12–15 % of the page. A 20% crop adds a safe margin. 300 DPI is needed to reliably OCR small printed digits (e.g. `233-10166763`) on low-quality scans — lower DPI is the primary cause of missed AWB numbers. Running in parallel on just the top 20% keeps total wall-clock time well below the full-page sequential mode.
 
+**Cluster radii (boundary deduplication):**
+
+The fuzzy sliding-window scanner produces multiple consecutive hits for the same physical marker (the window advances one char at a time). Two cluster radii control how these hits are collapsed:
+
+| Cluster step | Radius | Rationale |
+|---|---|---|
+| Internal — inside `_find_shipper_name_markers` | **50 chars** | Sliding-window duplicates span at most `len(marker) − 1` = 24 chars; 50 is a safe collapse margin |
+| Merge — primary + secondary combined in `_presplit_by_shipper_marker` | **200 chars** | Large enough to unify "Shipper's Name" and "Shipper's Account" hits for the same AWB header (real separation ≤ ~150 chars in linearised 2-column OCR), small enough not to absorb a genuine second boundary when intermediate pages (e.g. manifest pages) produce sparse OCR output (as few as ~80 chars in the top-20% crop) |
+
+> **Known failure mode (fixed):** a merge radius of 500 caused the second MAWB in a `MAWB → Manifest → Manifest → MAWB` sequence to be silently dropped when the two manifest pages produced little OCR text, placing both MAWB markers within 500 chars in the concatenated string. Reducing the merge radius to 200 resolves this.
+
 ---
 
 ### 4.3 AI Extraction — `AwbVisionExtractor` + `ClaudeVisionProvider`

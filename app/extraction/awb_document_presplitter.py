@@ -227,8 +227,11 @@ class AwbDocumentPreSplitter:
             return []
 
         # CLUSTER: group overlapping sliding-window hits into one boundary each.
-        # Two real AWBs never start within 500 chars of each other on multi-page PDFs.
-        cluster_radius = 500
+        # The sliding window produces consecutive hits spanning at most len(marker)-1 = 24
+        # chars for the same real occurrence. A radius of 50 is sufficient to collapse
+        # all duplicates without risking eating a genuine second boundary on an adjacent
+        # page with sparse OCR output (which can be as few as ~80 chars).
+        cluster_radius = 50
         clustered = []
         last_pos = None
         for pos in sorted(filtered_positions):
@@ -338,13 +341,16 @@ class AwbDocumentPreSplitter:
         primary_positions = self._find_shipper_name_markers(full_text)
         secondary_positions = self._find_shipper_account_markers(full_text)
 
-        # Merge and re-cluster with radius 500 so that primary and secondary hits
-        # for the SAME boundary (which may be a few chars apart) collapse into one.
+        # Merge and re-cluster with radius 200 so that primary and secondary hits
+        # for the SAME boundary (which may be up to ~150 chars apart in linearised OCR
+        # of a 2-column AWB header) collapse into one, while still being small enough
+        # not to eat a genuine second boundary when intermediate pages (e.g. a manifest)
+        # produce sparse OCR output (as few as ~80 chars per page in the top-20% crop).
         combined = sorted(set(primary_positions) | set(secondary_positions))
         marker_positions: List[int] = []
         last_pos = None
         for pos in combined:
-            if last_pos is None or pos - last_pos > 500:
+            if last_pos is None or pos - last_pos > 200:
                 marker_positions.append(pos)
             last_pos = pos
         
