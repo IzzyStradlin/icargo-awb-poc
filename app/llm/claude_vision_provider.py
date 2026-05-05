@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import time
 from typing import Optional
 
 import httpx
+
+_log = logging.getLogger(__name__)
 
 
 _EXTRACTION_PROMPT = """\
@@ -200,6 +203,10 @@ class ClaudeVisionProvider:
         rotations = page_rotations or {}
 
         b64_pages: list[str] = []
+        # DEBUG_SAVE_IMAGES: set to a directory path to save each rendered page as PNG.
+        # Example: set DEBUG_SAVE_IMAGES=C:\tmp\awb_debug in the environment.
+        debug_dir = os.getenv("DEBUG_SAVE_IMAGES")
+
         for p in range(fitz_start, min(fitz_end + 1, total)):
             page = doc[p]
             page_num_1based = p + 1  # match presplitter convention
@@ -208,10 +215,15 @@ class ClaudeVisionProvider:
             if page_num_1based in rotations:
                 # Tesseract OSD told us exactly how much to rotate
                 correction = rotations[page_num_1based]
+                _log.debug("Page %d: OSD-based rotation=%d°", page_num_1based, correction)
             else:
                 # Fallback heuristic: landscape → assume 90° CW scan, correct CCW
                 rect = page.bound()  # accounts for PDF /Rotate flag
                 correction = 90 if rect.width > rect.height else 0
+                _log.debug(
+                    "Page %d: heuristic rotation=%d° (bound w=%.0f h=%.0f)",
+                    page_num_1based, correction, rect.width, rect.height,
+                )
 
             if correction != 0:
                 mat = fitz.Matrix(1.5, 1.5).prerotate(correction)
@@ -226,6 +238,14 @@ class ClaudeVisionProvider:
                 mat2 = fitz.Matrix(1.0, 1.0).prerotate(correction) if correction != 0 else fitz.Matrix(1.0, 1.0)
                 pix = page.get_pixmap(matrix=mat2, colorspace=fitz.csRGB)
                 png_bytes = pix.tobytes("png")
+
+            # Optionally save to disk for visual inspection
+            if debug_dir:
+                import pathlib
+                pathlib.Path(debug_dir).mkdir(parents=True, exist_ok=True)
+                out_path = pathlib.Path(debug_dir) / f"page_{page_num_1based:03d}_rot{correction}.png"
+                out_path.write_bytes(png_bytes)
+                _log.info("DEBUG: saved %s", out_path)
 
             b64_pages.append(base64.standard_b64encode(png_bytes).decode())
         doc.close()
@@ -314,7 +334,7 @@ class ClaudeVisionProvider:
         pdf_bytes: bytes,
         start_page: int = 0,
         end_page: int = 0,
-        max_images: int = 10,
+        max_images: int = 20,
         page_rotations: Optional[dict] = None,
     ) -> str:
         """
@@ -337,6 +357,7 @@ class ClaudeVisionProvider:
         start_page     : 1-based first page (presplitter convention)
         end_page       : 1-based last page  (presplitter convention)
         max_images     : safety cap — never send more than this many images per call
+                         (default 20; raise if you have very large consolidations)
         page_rotations : per-page CCW rotation angles from Tesseract OSD
                          (1-based page_num → degrees). If absent, falls back
                          to landscape heuristic.
@@ -345,6 +366,16 @@ class ClaudeVisionProvider:
         if not b64_images:
             raise ValueError(
                 f"No pages found in range {start_page}-{end_page}"
+            )
+
+        _log.info(
+            "extract_mawb_with_hawbs_json: pages %d-%d → %d rendered images (cap=%d)",
+            start_page, end_page, len(b64_images), max_images,
+        )
+        if len(b64_images) > max_images:
+            _log.warning(
+                "Truncating from %d to %d images (increase max_images to send all pages)",
+                len(b64_images), max_images,
             )
 
         content: list = []

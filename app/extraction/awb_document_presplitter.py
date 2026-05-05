@@ -1,22 +1,30 @@
 """
-Pre-split PDF into individual AWB documents BEFORE OCR.
+Pre-split PDF into individual AWB documents BEFORE full-page OCR.
 
 Strategy:
-1. Extract text from each PDF page (native or OCR)
-2. Identify AWB boundaries using a dual-marker approach:
-   - PRIMARY:   "Shipper's Name and Address" (fuzzy 0.72 tolerance)
-   - SECONDARY: "Shipper's Account Number"   (fuzzy 0.75 tolerance)
-3. Merge both marker sets and re-cluster within 500 chars
-4. Assign pages to documents based on marker positions
-5. Fall back to MAWB phrase markers or AWB-number splitting if no boundaries found
+1. Extract text from each PDF page (native pdfplumber or Tesseract OCR).
+2. Identify document boundaries using a dual-marker approach:
+     PRIMARY:   "Shipper's Name and Address" (fuzzy tolerance 0.72)
+     SECONDARY: "Shipper's Account Number"   (fuzzy tolerance 0.75)
+3. Merge primary + secondary hits and re-cluster with a radius of 200 chars
+   — large enough to unify two hits for the same AWB header, small enough
+   not to absorb a genuine second boundary when intermediate pages (e.g. a
+   manifest) produce sparse OCR output in the top-20% crop.
+4. Assign pages to documents based on marker positions.
+5. Fall back to MAWB phrase markers or AWB-number splitting if no
+   boundary markers are found.
 
-This avoids OCR contamination between documents.
+Separating documents before extraction prevents OCR text from one AWB
+contaminating the extraction context of the next.
 """
 
+import logging
 from typing import List, Dict, Optional
 from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
+
+_log = logging.getLogger(__name__)
 
 try:
     import pdfplumber
@@ -108,17 +116,18 @@ class AwbDocumentPreSplitter:
         """
         documents = []
         current_doc_start = None
-        seen_awbs = set()  # Track AWBs we've seen to detect new ones
+        seen_awbs: set = set()  # AWB numbers encountered so far; used to detect new ones
 
         for page_num in sorted(page_texts.keys()):
             page_text = page_texts[page_num]
-            
-            # Check if this page has a NEW AWB number
+
+            # Identify AWB numbers present on this page.
             current_awbs = set(extract_msc_awbs(page_text))
+            # A new AWB number (not seen in any prior page) signals a document boundary.
             new_awbs = current_awbs - seen_awbs
-            
+
             if new_awbs and current_doc_start is not None:
-                # Found NEW AWB number - close previous document, start new one
+                # Close the current document and start a new one at this page.
                 documents.append({
                     "start_page": current_doc_start,
                     "end_page": page_num - 1,
@@ -128,12 +137,12 @@ class AwbDocumentPreSplitter:
                 })
                 current_doc_start = page_num
             elif current_doc_start is None:
-                # First page or first with AWB
+                # First page seen — open the first document.
                 current_doc_start = page_num
-            
+
             seen_awbs.update(current_awbs)
 
-        # Close final document
+        # Close the final open document.
         if current_doc_start is not None:
             max_page = max(page_texts.keys())
             documents.append({
@@ -727,33 +736,170 @@ class AwbDocumentPreSplitter:
     @staticmethod
     def _detect_rotation_page(page_num: int, img_arr) -> tuple[int, int]:
         """
-        Detect page orientation using Tesseract OSD (--psm 0) on the full
-        pre-rendered image.
+        Detect page orientation and return (page_num, ccw_degrees_to_correct).
 
-        Returns (page_num, rotate_degrees) where rotate_degrees is the angle
-        in degrees (0 / 90 / 180 / 270) needed to rotate the image
-        counter-clockwise to make the content upright.
-        Convention: Tesseract's `rotate` field = CCW degrees to correct.
+        Uses six strategies in cascade:
 
-        Falls back to (page_num, 0) if OSD is unavailable or fails (e.g. too
-        few characters on the page for reliable detection).
+          1. Pixel dimensions  — fast: w > h means the scan itself is landscape.
+          2. OSD (non-zero)    — if Tesseract is confident AND says rotate ≠ 0,
+                                 trust it immediately (handles true rotated scans).
+          3. Generic rotation probe — ALWAYS runs, even when OSD returns 0°.
+                                 Applies all four rotations (k=0,1,2,3) to the page
+                                 BODY (below the top 25%, skipping any portrait
+                                 company header), OCRs each, and picks the rotation
+                                 with the highest HAWB keyword score.
+          4. OSD (zero)        — if OSD was confident with 0° AND probe found
+                                 nothing → trust OSD and return 0°.
+          5. OSD retry         — run OSD on the 90°-CCW-rotated image; if it now
+                                 reads upright with good confidence, the original
+                                 needed 90° CCW.
+          6. Give up           — return 0° (no rotation detected).
 
-        NOTE: Runs in a worker thread — img_arr must be a plain numpy array
-        (no fitz objects).
+        NOTE: Runs in a worker thread. img_arr must be a plain numpy array —
+        no fitz/PyMuPDF objects (those are not thread-safe).
         """
         try:
             import pytesseract as _tess
             from PIL import Image as _PILImage
-            pil_img = _PILImage.fromarray(img_arr)
+            import numpy as _np
+        except ImportError:
+            return page_num, 0
+
+        h, w = img_arr.shape[:2]
+
+        # ── Strategy 1: pixel dimensions ───────────────────────────────────
+        if w > h:
+            _log.debug(
+                "Page %d: landscape pixels (w=%d > h=%d) → 90° CCW",
+                page_num, w, h,
+            )
+            return page_num, 90
+
+        # ── Strategy 2: OSD — trust only if confident AND non-zero ─────────
+        # --oem 0: legacy engine required for --psm 0 (OSD).
+        # --oem 1 (LSTM) is silently incompatible with OSD.
+        osd_rotate: int | None = None
+        try:
             osd = _tess.image_to_osd(
-                pil_img,
-                config="--psm 0 --oem 1",
+                _PILImage.fromarray(img_arr),
+                config="--psm 0 --oem 0",
                 output_type=_tess.Output.DICT,
             )
+            orient_conf = float(osd.get("orientation_conf", 0.0))
             rotate = int(osd.get("rotate", 0))
-            return page_num, rotate
-        except Exception:
+            _log.debug(
+                "Page %d OSD: rotate=%d conf=%.1f", page_num, rotate, orient_conf,
+            )
+            if orient_conf >= 3.0:
+                osd_rotate = rotate  # remember the confident result
+                if rotate != 0:
+                    # OSD says this page is clearly NOT upright → trust it
+                    return page_num, rotate
+                # rotate == 0: OSD says upright, BUT we still run the keyword
+                # probe below because OSD can be fooled by a portrait company
+                # header when the HAWB body is landscape.
+        except Exception as _osd_exc:
+            _log.debug("Page %d OSD failed: %s", page_num, _osd_exc)
+
+        # ── Strategy 3: generic 4-rotation body probe ──────────────────────
+        # Always runs, even when OSD returned 0° confidently.
+        #
+        # Applies all four rotations (0°, 90°, 180°, 270°) to the page BODY
+        # (everything below the top 25%, which may contain a portrait company
+        # header), OCRs each rotated version, and picks the rotation that
+        # produces the highest HAWB keyword count.
+        #
+        # This is fully generic:
+        #   k=1 (90°  CCW) body readable → HAWB was printed landscape 90° CW
+        #   k=2 (180°)     body readable → HAWB was printed upside-down
+        #   k=3 (270° CCW) body readable → HAWB was printed landscape 90° CCW
+        #   k=0 (0°)  wins              → page is truly upright, no rotation
+        #
+        # Decision rule: if any non-zero rotation beats k=0, apply it.
+        # Tie between non-zero rotations → choose the one with more keywords.
+        # Tie between a non-zero rotation and k=0 → no rotation (conservative).
+        #
+        # Why exclude the top 25%?
+        # Company letterheads (DSV, Schenker, …) often contain words like
+        # "airway" or "manifest" in small print. Excluding that area avoids
+        # false positives that could bias the probe.
+        _HAWB_KEYWORDS = frozenset({
+            "shipper", "consignee", "sender", "notify", "house", "hawb",
+            "airway", "waybill", "recipient", "manifest",
+        })
+        try:
+            strip_h = max(1, int(h * 0.25))
+            body = img_arr[strip_h:, :, :]  # exclude portrait header area
+
+            cfg_probe = "--oem 1 --psm 6"
+
+            def _kw_score(arr) -> tuple[int, list]:
+                txt = _tess.image_to_string(
+                    _PILImage.fromarray(arr), lang="eng", config=cfg_probe
+                ).lower()
+                hits = [kw for kw in _HAWB_KEYWORDS if kw in txt]
+                return len(hits), hits
+
+            # Score all four rotations
+            _CORRECTION = {0: 0, 1: 90, 2: 180, 3: 270}
+            probe: dict[int, tuple[int, list]] = {}
+            for k in (0, 1, 2, 3):
+                probe[k] = _kw_score(_np.rot90(body, k=k) if k else body)
+
+            _log.debug(
+                "Page %d rotation probe: 0°=%d%s  90°=%d%s  180°=%d%s  270°=%d%s",
+                page_num,
+                probe[0][0], probe[0][1],
+                probe[1][0], probe[1][1],
+                probe[2][0], probe[2][1],
+                probe[3][0], probe[3][1],
+            )
+
+            best_k = max(probe, key=lambda k: probe[k][0])
+            best_score, best_hits = probe[best_k]
+            k0_score = probe[0][0]
+
+            if best_k != 0 and best_score > k0_score:
+                correction = _CORRECTION[best_k]
+                _log.debug(
+                    "Page %d rotation probe → %d° "
+                    "(k=%d score=%d%s beats upright score=%d)",
+                    page_num, correction, best_k, best_score, best_hits, k0_score,
+                )
+                return page_num, correction
+
+            _log.debug(
+                "Page %d rotation probe: upright wins (k0=%d), no rotation",
+                page_num, k0_score,
+            )
+
+        except Exception as _probe_exc:
+            _log.debug("Page %d rotation probe failed: %s", page_num, _probe_exc)
+
+        # ── Strategy 4: OSD said 0° with confidence → trust it ─────────────
+        if osd_rotate == 0:
+            _log.debug("Page %d: OSD confident 0°, keyword probe found nothing → no rotation", page_num)
             return page_num, 0
+
+        # ── Strategy 5: OSD retry on 90°-CCW-rotated image ─────────────────
+        try:
+            osd_90 = _tess.image_to_osd(
+                _PILImage.fromarray(_np.rot90(img_arr, k=1)),
+                config="--psm 0 --oem 0",
+                output_type=_tess.Output.DICT,
+            )
+            conf_90 = float(osd_90.get("orientation_conf", 0.0))
+            rotate_90 = int(osd_90.get("rotate", 0))
+            _log.debug("Page %d OSD@90°CCW: rotate=%d conf=%.1f", page_num, rotate_90, conf_90)
+            if conf_90 >= 3.0 and rotate_90 == 0:
+                _log.debug("Page %d OSD retry confirms 90° CCW needed", page_num)
+                return page_num, 90
+        except Exception as _retry_exc:
+            _log.debug("Page %d OSD retry failed: %s", page_num, _retry_exc)
+
+        # ── Strategy 6: give up ─────────────────────────────────────────────
+        _log.debug("Page %d: no rotation detected (portrait, w=%d h=%d)", page_num, w, h)
+        return page_num, 0
 
     def presplit_pdf_fast(self, raw_pdf: bytes, max_workers: int = 4) -> List[Dict[str, any]]:
         """
@@ -814,9 +960,12 @@ class AwbDocumentPreSplitter:
             finally:
                 fitz_doc.close()
 
-        # ── Step 3: parallel Tesseract OCR + OSD on pre-rendered images ───
-        # OCR (top 20%, PSM 6) → text for boundary detection
-        # OSD (full image, PSM 0) → per-page rotation correction angle
+        # ── Step 3: parallel Tesseract OCR + OSD on pre-rendered images ────
+        # Two tasks are submitted per scanned page (both run concurrently):
+        #   a) OCR  — top-20% crop, PSM 6  → text used for boundary detection
+        #   b) OSD  — full image,  PSM 0   → per-page CCW rotation correction angle
+        # The results are collected separately: OCR fills page_texts,
+        # OSD fills page_rotations (only non-zero entries are stored).
         page_rotations: Dict[int, int] = {}
         if page_images:
             ocr_futures: dict = {}
@@ -833,10 +982,11 @@ class AwbDocumentPreSplitter:
                     if rotation != 0:
                         page_rotations[pn] = rotation
 
-        # ── Step 3: run the standard splitting logic on collected texts ─────
+        # ── Step 4: run the standard splitting logic on collected texts ─────
+        # Strategy 1: dual shipper-marker (primary + secondary combined).
         documents = self._presplit_by_shipper_marker(page_texts)
         if len(documents) <= 1:
-            # Try MAWB marker fallback
+            # Strategy 2: MAWB phrase markers ("Not Negotiable Air Waybill…").
             mawb_starts = {
                 pn: self._find_mawb_start_in_page(txt)
                 for pn, txt in page_texts.items()
@@ -868,12 +1018,15 @@ class AwbDocumentPreSplitter:
             if len(docs2) > 1:
                 documents = docs2
             else:
+                # Strategy 3 (last resort): split on first appearance of each
+                # distinct MSC AWB number (233-XXXXXXXX). Works even when all
+                # marker phrases are too corrupted by OCR to match fuzzily.
                 documents = self._presplit_by_awb_as_markers(page_texts, {})
 
         self._enrich_documents_with_awbs(documents, page_texts)
         documents = self._merge_same_awb_documents(documents)
 
-        # ── Step 5: attach page text and rotation map to each document ────
+        # ── Step 5: attach full page text and rotation map to each document ─
         for doc in documents:
             doc["text"] = "\n".join(
                 page_texts.get(p, "")

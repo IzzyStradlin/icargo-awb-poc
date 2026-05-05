@@ -1,8 +1,17 @@
+import logging
 import streamlit as st
 import os
 
 from dotenv import load_dotenv
 load_dotenv()
+
+# Configure logging — set AWB_LOG_LEVEL=DEBUG (or INFO/WARNING) via env var.
+# DEBUG shows per-page OSD rotation results and Claude rendering decisions.
+_log_level = os.getenv("AWB_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _log_level, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 # Import MSC Branding
 from app.ui.assets.branding import get_brand_info, get_css, get_logo_data_uri

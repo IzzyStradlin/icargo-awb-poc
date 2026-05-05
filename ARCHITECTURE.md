@@ -194,10 +194,61 @@ Each MAWB page range is converted to PNG images (via PyMuPDF/fitz) and sent to *
 **Key design decisions:**
 - No intermediate OCR text is sent to Claude — images are sent directly, preserving the 2-column IATA AWB layout that regex cannot reliably parse.
 - A structured JSON prompt instructs Claude to return exactly the AWB schema fields (`awb_number`, `shipper`, `consignee`, `origin`, `destination`, `flight_number`, `pieces`, `weight`, …).
-- **Landscape normalisation** — before base64-encoding, `page.bound()` (which already accounts for the PDF `/Rotate` flag) is checked for landscape orientation (`width > height`). Landscape pages (typical of HAWB forms stored or scanned rotated 90° clockwise) are re-rendered with `fitz.Matrix(1.5, 1.5).prerotate(90)` — a 90° counter-clockwise correction baked directly into the PyMuPDF render matrix, no PIL dependency. This ensures Claude always receives portrait-oriented images and significantly improves HAWB field extraction accuracy.
-- **OSD-based rotation (full pipeline)** — because scans from warehouses can arrive at any rotation (0°, 90°, 180°, 270°), the presplit phase runs Tesseract OSD (`--psm 0`) on the full image of every scanned page **in parallel** with the existing boundary-detection OCR. The detected correction angle is stored in `page_rotations` (a `dict[page_num → CCW_degrees]` added to each presplit document dict). `ClaudeVisionProvider._render_pages` accepts this dict and applies `Matrix.prerotate(correction)` per page, handling all four rotation cases. The landscape heuristic acts as a fallback for native-text pages or when Tesseract OSD is unavailable.
+- **Orientation correction** — before base64-encoding, `ClaudeVisionProvider._render_pages` applies `fitz.Matrix(1.5, 1.5).prerotate(correction)` per page, where `correction` (CCW degrees) comes from `page_rotations` when available, or from a dimension heuristic (`w > h` → 90° CCW) as a fallback. This ensures Claude always receives upright images regardless of how the PDF was scanned or stored.
+- **OSD-based rotation (full pipeline)** — because scans from warehouses can arrive at any rotation (0°, 90°, 180°, 270°), the presplit phase runs Tesseract OSD (`--psm 0 --oem 0`) on the full image of every scanned page **in parallel** with the existing boundary-detection OCR. The detected correction angle is stored in `page_rotations` (a `dict[page_num → CCW_degrees]` added to each presplit document dict). `ClaudeVisionProvider._render_pages` accepts this dict and applies `Matrix.prerotate(correction)` per page, handling all four rotation cases.
+
+  `_detect_rotation_page` applies five strategies in cascade:
+
+  | Priority | Strategy | Trigger |
+  |---|---|---|
+  | 1 | **Pixel dimensions** | `w > h` (pixmap is landscape) → 90° CCW immediately |
+  | 2 | **OSD non-zero** (`--psm 0 --oem 0`) | `orientation_conf ≥ 3.0` **and** `rotate ≠ 0` → trust immediately |
+  | 3 | **Generic rotation probe** *(see below)* | **always runs**, even if OSD returned 0° confidently |
+  | 4 | **OSD zero** | OSD was confident 0° **and** probe found nothing → return 0° |
+  | 5 | **OSD retry on pre-rotated image** | rotate image 90° CCW, re-run OSD; if `conf ≥ 3.0` and `rotate=0` → original needed 90° CCW |
+  | 6 | **Give up** | return 0° (no rotation detected) |
+
+  **Strategy 3 — Generic rotation probe:**
+
+  OSD is unreliable when a page has a portrait company header at the top and landscape HAWB content in the body — the portrait header dominates and OSD confidently returns 0°. The strip-based approach (checking left/right columns for keywords) is also fragile because the result depends on which column the content falls in and which direction the text runs.
+
+  The probe is therefore fully generic: it applies all four rotations (0°, 90°, 180°, 270°) to the **page body** (the area below the top 25%, which may contain the portrait letterhead) and selects the rotation that maximises HAWB keyword hits.
+
+  ```
+  ┌─────────────────────────┐
+  │     COMPANY HEADER      │  ← excluded (top 25%)
+  ├─────────────────────────┤
+  │                         │
+  │   body — OCR scored     │  ← rotated as k=0, 1, 2, 3
+  │   at all 4 rotations    │
+  │                         │
+  └─────────────────────────┘
+
+  best k=1 (90°  CCW of body readable) → HAWB was printed landscape 90° CW  → correction 90° CCW
+  best k=2 (180° of body readable)     → HAWB was printed upside-down        → correction 180°
+  best k=3 (270° CCW of body readable) → HAWB was printed landscape 90° CCW  → correction 270° CCW
+  best k=0 (upright wins)              → page is truly portrait               → no rotation
+  ```
+
+  Decision rule: if any non-zero k produces more keyword hits than k=0 (upright), apply the corresponding correction. Ties between k=0 and another k → no rotation (conservative). Ties between two non-zero rotations → the one with more hits wins (k ordering breaks ties deterministically).
+
+  HAWB keywords scored: `shipper`, `consignee`, `sender`, `notify`, `house`, `hawb`, `airway`, `waybill`, `recipient`, `manifest`. The top 25% is excluded because company letterheads often contain words like "airway" or "manifest" in small print that would generate false positives.
+
+  OSD engine notes:
+  - `--oem 0` (legacy engine) is mandatory for `--psm 0`; `--oem 1` (LSTM) is silently incompatible with OSD.
+  - Results with `orientation_conf < 3.0` are discarded — on sparse pages OSD has too few characters to be reliable.
+
+  > **Known failure mode (fixed — `--oem` bug):** using `--oem 1` with PSM 0 caused OSD to silently fail on low-text pages. The fallback always returned 0° rotation, so Claude received the page sideways. Switching to `--oem 0` resolves this.
+
+  > **Known failure mode (fixed — mixed-orientation page, structural bug):** OSD returning 0° with high confidence caused an immediate return before the rotation probe ran (probe was in the `except` block, never reached on OSD success). Fixed by restructuring the cascade: the OSD result is remembered but only acted upon for non-zero results; the rotation probe always runs as Strategy 3.
+
+  > **Known failure mode (fixed — strip-based probe fragility):** earlier iterations used a left/right strip approach that required knowing which strip the content was in and which direction the text ran — subtle to reason about and easy to get wrong (several 90°/180°/270° inversions during development). Replaced with the generic 4-rotation body probe, which is correct by construction regardless of orientation.
+
+  > **Known limitation — 90° vs 270° ambiguity:** when a landscape page could be portrait either way (e.g. a single-row manifest table), the probe scores k=1 and k=3 equally — both rotations produce the same readable keywords. `max()` then picks deterministically by dictionary order, which may be wrong. Resolving the ambiguity would require a layout-aware signal (e.g. "AWB number column is always on the left") that the keyword probe does not implement. In practice this is acceptable: see the note below.
+
+  > **Observed behaviour — Claude appears robust to 180° inversion (empirical):** in a single production test, a page corrected to portrait-upside-down (270° CCW applied instead of the ideal 90° CCW) was still read and extracted correctly by Claude Vision. This is consistent with vision models being trained on data in various orientations, but it is **not a documented guarantee**. The practical consequence of the ambiguity above is therefore limited: the probe correctly identifies that a landscape-to-portrait correction is needed (the critical step), even when it cannot determine the exact direction.
 - The first call returns the **MAWB** (portrait page). HAWB pages are included in a second call that returns `{ "mawb": {...}, "hawbs": [{...}] }`. All images sent have already been normalised to portrait.
-- Safety cap: max 10 images per API call to stay within the token budget.
+- Safety cap: max 20 images per API call (default; overridable via `max_images` parameter) to stay within the token budget.
 - Rendering DPI: `fitz.Matrix(1.5, 1.5)` ≈ 108 DPI → ~1263 px long side for A4, just under Claude's 1568 px resize threshold (optimal quality-to-token ratio).
 - A text-only fallback (`extract_from_text`) is available when PDF bytes are absent.
 
@@ -298,8 +349,10 @@ AwbDocumentPreSplitter.presplit_pdf_fast / presplit_pdf_with_text
   → List[{ awb_number, start_page, end_page, text, page_rotations }]
   │
   │  Smart mode runs TWO parallel Tesseract tasks per scanned page:
-  │    • PSM 6  (top 20%)  → boundary-detection text
-  │    • PSM 0 / OSD       → per-page rotation correction angle
+  │    • PSM 6, OEM 1  (top 20%)   → boundary-detection text
+  │    • PSM 0, OEM 0 / OSD        → per-page rotation correction angle
+  │                                   4-step cascade: OSD conf≥3 → w>h dim →
+  │                                   OSD@90°CCW → HAWB keyword probe (left vs top strip)
   │  page_rotations: { page_num → CCW_degrees }  (only non-zero entries)
        │
        ├──► [optional] 🖼 Preview PNG ZIP (no Claude call)
