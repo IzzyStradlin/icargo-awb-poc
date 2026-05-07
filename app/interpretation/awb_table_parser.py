@@ -158,39 +158,3 @@ class AwbTableParser:
         
         return flight_number, flight_date
 
-
-def test_table_parser():
-    """Test the table parser with real messy OCR"""
-    
-    messy_ocr = r"""
-    Gross ¥@] [Rate Class Chargeable
-    No. Of |. Weight » Weight Total 'Nature and Quantity of Goods
-    Pieces Commodity 'Charge otal (incl, Dimensions or Volume)
-    RCP. tem No.
-    1 806.91/K 4.50) 12375.00} |Consolidation as per attached list
-    239 PCS ON PMC10434CP Charge: 2750.00
-    VOL 16.500 M3
-    239 SLAC
-    1 806.91 12375.00}
-    
-    Flight: CP113/19
-    """
-    
-    parser = AwbTableParser()
-    
-    # Test quantity/weight extraction
-    result = parser.extract_quantity_and_weights(messy_ocr)
-    print("Table Parser Results:")
-    print(f"  Pieces: {result['pieces']} (expected: 239)")
-    print(f"  Gross Weight: {result['gross_weight']} (expected: 12375.0)")
-    print(f"  Chargeable Weight: {result['chargeable_weight']} (expected: 2750.0)")
-    
-    # Test flight extraction
-    flight, date = parser.extract_flight_info(messy_ocr)
-    print(f"\nFlight Info:")
-    print(f"  Flight: {flight} (expected: CP113/19)")
-    print(f"  Date: {date}")
-
-
-if __name__ == '__main__':
-    test_table_parser()

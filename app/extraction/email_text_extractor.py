@@ -4,7 +4,7 @@ from bs4 import BeautifulSoup
 
 class EmailTextExtractor:
     def extract_text(self, body_text: str) -> str:
-        """Se HTML → testo, altrimenti passa-through."""
+        """If HTML content is detected, convert to plain text; otherwise pass through unchanged."""
         if "<html" in body_text.lower():
             soup = BeautifulSoup(body_text, "lxml")
             return soup.get_text(separator="\n")

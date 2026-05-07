@@ -16,9 +16,9 @@ class ICargoIBSClient:
         self.timeout = float(os.getenv("ICARGO_TIMEOUT", "15"))
 
         if not self.base_url:
-            raise RuntimeError("ICARGO_BASE_URL mancante in .env")
+            raise RuntimeError("ICARGO_BASE_URL missing from .env")
         if not self.username or not self.password:
-            raise RuntimeError("ICARGO_USERNAME / ICARGO_PASSWORD mancanti in .env")
+            raise RuntimeError("ICARGO_USERNAME / ICARGO_PASSWORD missing from .env")
 
     def authenticate(self) -> str:
         url = f"{self.base_url}/auth/m4/private/v1/authenticate"
@@ -30,7 +30,7 @@ class ICargoIBSClient:
             r.raise_for_status()
             data = r.json()
 
-        # struttura: data["body"]["security"]["id_token"]
+        # response structure: data["body"]["security"]["id_token"]
         token = data["body"]["security"]["id_token"]
         self.token = token
         return token

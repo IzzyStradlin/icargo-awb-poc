@@ -10,7 +10,7 @@ class EmailIngestResult:
         self.attachments = attachments  # (filename, bytes)
 
 class EmailIngestor:
-    """Parsing file .eml locale per PoC (IMAP out-of-scope PoC)."""
+    """Parses local .eml files for the PoC (IMAP is out of scope for this PoC)."""
 
     def parse_eml(self, raw_bytes: bytes) -> EmailIngestResult:
         msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)

@@ -1,6 +1,6 @@
 # app/integration/awb_repository.py
 from typing import Optional, Dict, Any
-from .icargo_client import ICargoClient
+from .icargo_ibs_client import ICargoIBSClient
 
 class AwbRepository:
     """
@@ -8,8 +8,8 @@ class AwbRepository:
     API path is a PoC placeholder: adapt to the real iCargo paths.
     """
 
-    def __init__(self, client: Optional[ICargoClient] = None):
-        self.client = client or ICargoClient()
+    def __init__(self, client: Optional[ICargoIBSClient] = None):
+        self.client = client or ICargoIBSClient()
 
     def get_awb(self, awb_prefix: str, awb_serial: str) -> Dict[str, Any]:
         path = f"awb/{awb_prefix}/{awb_serial}"

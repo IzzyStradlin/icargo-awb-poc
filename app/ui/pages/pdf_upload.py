@@ -501,7 +501,7 @@ def render_pdf_upload(on_back):
 
         hawb_badge = f" • {len(display_hawbs)} HAWB" if display_hawbs else ""
         with st.expander(f"📦 MAWB {awb_num}{hawb_badge}", expanded=(idx == 0)):
-            source_label = "🔮 Claude Vision (re-estratto)" if refined else "🔮 Claude Vision"
+            source_label = "🔮 Claude Vision (re-extracted)" if refined else "🔮 Claude Vision"
             st.success(source_label)
 
             # ── MAWB fields ──────────────────────────────────────────────

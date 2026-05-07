@@ -25,4 +25,3 @@ class AwbDiffEngine:
                 "match": extracted.get(f) == system.get(f),
             })
         return out
-``

@@ -1,5 +1,5 @@
 # app/ui/web_fastapi.py
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from pydantic import BaseModel
 from ..ingestion.pdf_ingestor import PDFIngestor
 from ..extraction.pdf_text_extractor import PDFTextExtractor

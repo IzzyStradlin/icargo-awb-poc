@@ -2,7 +2,7 @@
 from .awb_schema import AwbData
 
 class AwbNormalizer:
-    """Normalizza e valida i campi AWB (formati base per PoC)."""
+    """Normalizes and validates AWB fields (basic formats for the PoC)."""
 
     def normalize(self, data: AwbData) -> AwbData:
         if data.origin:

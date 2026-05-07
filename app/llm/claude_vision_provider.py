@@ -142,8 +142,8 @@ class ClaudeVisionProvider:
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise RuntimeError(
-                "ANTHROPIC_API_KEY non trovata nell'ambiente. "
-                "Aggiungi ANTHROPIC_API_KEY=sk-ant-... al file .env"
+                "ANTHROPIC_API_KEY not found in environment. "
+                "Add ANTHROPIC_API_KEY=sk-ant-... to the .env file"
             )
         timeout = float(os.getenv("CLAUDE_TIMEOUT", "120"))
         self._http = httpx.Client(
