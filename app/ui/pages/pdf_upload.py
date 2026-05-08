@@ -6,8 +6,10 @@ No OCR step exposed to user. No Cohere. No regex parsing.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
+import zipfile
 from typing import Optional
 
 import requests
@@ -219,14 +221,35 @@ def _hawb_form(hawb_num: str, data: dict):
 def _split_pdf(raw_pdf: bytes, fast: bool = False) -> list[dict]:
     """
     Split the PDF into one document per MAWB.
-    fast=True  → parallel low-DPI Tesseract on top-40% of each page (~5-10× faster)
-    fast=False → full-quality sequential OCR on the whole page
+    fast=True  → parallel 300 DPI Tesseract on top 20% of each page (recommended)
+    fast=False → full-quality sequential OCR on the whole page (difficult scans)
     """
     extractor = PDFTextExtractor()
     presplitter = AwbDocumentPreSplitter(extractor=extractor)
     if fast:
         return presplitter.presplit_pdf_fast(raw_pdf)
     return presplitter.presplit_pdf_with_text(raw_pdf, use_extractor=True)
+
+
+def _extract_pdfs_from_upload(uploaded) -> list[dict]:
+    """
+    Normalises a file upload to a list of {"name": str, "bytes": bytes} dicts.
+    Accepts a single PDF or a ZIP archive containing one or more PDFs.
+    Files inside the ZIP are sorted by name for deterministic ordering.
+    Non-PDF entries and macOS metadata folders inside the ZIP are silently skipped.
+    """
+    raw = uploaded.read()
+    if uploaded.name.lower().endswith(".zip"):
+        results = []
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            pdf_entries = sorted(
+                name for name in zf.namelist()
+                if name.lower().endswith(".pdf") and not name.startswith("__MACOSX")
+            )
+            for entry in pdf_entries:
+                results.append({"name": entry.split("/")[-1], "bytes": zf.read(entry)})
+        return results
+    return [{"name": uploaded.name, "bytes": raw}]
 
 
 # ── Main page ──────────────────────────────────────────────────────────────
@@ -250,6 +273,7 @@ def render_pdf_upload(on_back):
     for key, val in {
         "raw_pdf_bytes": None,
         "pdf_name": None,
+        "batch_pdfs": [],
         "split_documents": None,
         "split_mode": "fast",
         "awb_results": None,
@@ -261,26 +285,45 @@ def render_pdf_upload(on_back):
             st.session_state[key] = val
 
     # ── Upload ─────────────────────────────────────────────────────────────
-    uploaded = st.file_uploader("Select a PDF", type=["pdf"])
+    uploaded = st.file_uploader(
+        "Select a PDF or a ZIP archive containing PDFs",
+        type=["pdf", "zip"],
+    )
     if not uploaded:
-        st.info("Upload a PDF to get started.")
+        st.info("Upload a PDF or a ZIP archive containing PDFs to get started.")
         return
 
-    raw_pdf = uploaded.read()
-
-    # Reset everything when a new file is uploaded
+    # Normalise upload → list of PDFs; only re-parse when the file changes.
     if st.session_state.get("pdf_name") != uploaded.name:
+        batch_pdfs = _extract_pdfs_from_upload(uploaded)
+        if not batch_pdfs:
+            st.error("No PDF files found in the archive.")
+            return
         st.session_state["pdf_name"] = uploaded.name
-        st.session_state["raw_pdf_bytes"] = raw_pdf
+        st.session_state["batch_pdfs"] = batch_pdfs
+        st.session_state["raw_pdf_bytes"] = batch_pdfs[0]["bytes"]
         st.session_state["split_documents"] = None
         st.session_state["awb_results"] = None
         st.session_state["vision_refined_awbs"] = {}
         st.session_state["debug_page_texts"] = None
         st.session_state["debug_pdf_name"] = None
-    else:
-        st.session_state["raw_pdf_bytes"] = raw_pdf
 
-    st.success(f"📄 {uploaded.name} — {uploaded.size:,} bytes")
+    batch_pdfs: list[dict] = st.session_state["batch_pdfs"]
+    if not batch_pdfs:
+        st.error("No PDF files to process. Please re-upload the file.")
+        return
+
+    # raw_pdf kept for single-file features (debug panel, PNG preview)
+    raw_pdf = batch_pdfs[0]["bytes"]
+    is_zip = uploaded.name.lower().endswith(".zip")
+
+    if is_zip:
+        st.success(f"📦 {uploaded.name} — {len(batch_pdfs)} PDF file(s) found")
+        with st.expander("📄 Files in archive", expanded=False):
+            for p in batch_pdfs:
+                st.caption(f"• {p['name']} ({len(p['bytes']):,} bytes)")
+    else:
+        st.success(f"📄 {uploaded.name} — {uploaded.size:,} bytes")
 
     # ── Split mode selector ────────────────────────────────────────────────
     split_mode = st.radio(
@@ -294,7 +337,7 @@ def render_pdf_upload(on_back):
         horizontal=True,
         key="split_mode_radio",
     )
-    # If mode changed, force a re-split
+    # If mode changed, force a re-split (keep batch_pdfs — they come from the file)
     if split_mode != st.session_state.get("split_mode"):
         st.session_state["split_mode"] = split_mode
         st.session_state["split_documents"] = None
@@ -308,10 +351,19 @@ def render_pdf_upload(on_back):
     use_fast = (st.session_state["split_mode"] == "fast")
     if st.session_state["split_documents"] is None:
         mode_label = "⚡ smart" if use_fast else "🔬 normal"
-        with st.spinner(f"Detecting AWB documents in the PDF ({mode_label})..."):
+        src_label = f"{len(batch_pdfs)} PDF(s)" if is_zip else "the PDF"
+        with st.spinner(f"Detecting AWB documents in {src_label} ({mode_label})..."):
             try:
-                docs = _split_pdf(raw_pdf, fast=use_fast)
-                st.session_state["split_documents"] = docs
+                all_docs: list[dict] = []
+                for pdf_entry in batch_pdfs:
+                    docs = _split_pdf(pdf_entry["bytes"], fast=use_fast)
+                    for doc in docs:
+                        # Tag each split document with its source PDF so the
+                        # extraction step can use the correct PDF bytes.
+                        doc["_pdf_name"] = pdf_entry["name"]
+                        doc["_pdf_bytes"] = pdf_entry["bytes"]
+                    all_docs.extend(docs)
+                st.session_state["split_documents"] = all_docs
             except Exception as e:
                 st.error(f"Split error: {e}")
                 return
@@ -322,14 +374,15 @@ def render_pdf_upload(on_back):
         st.error("No MAWB document found in the PDF. Please ensure the PDF contains an Air Waybill.")
         return
 
-    awb_labels = [
-        f"AWB {doc.get('awb_number') or '—'} (pag. {doc.get('start_page')}–{doc.get('end_page')})"
-        for doc in split_docs
-    ]
     st.info(f"**{len(split_docs)} document(s) detected:** {', '.join(d.get('awb_number') or '—' for d in split_docs)}")
 
     # ── Debug: raw text + split boundaries ────────────────────────────────
     with st.expander("🔍 Debug split — raw text per page", expanded=False):
+        if is_zip:
+            st.info(
+                f"Showing raw page text for the first PDF in the archive "
+                f"(**{batch_pdfs[0]['name']}**) only."
+            )
         mode_badge = "⚡ Smart (300 DPI, top 20%)" if use_fast else "🔬 Normal (200 DPI, full page)"
         st.caption(
             f"Split mode used: **{mode_badge}**. "
@@ -401,17 +454,30 @@ def render_pdf_upload(on_back):
             buf = _zip_io.BytesIO()
             total_pages = 0
             with _zipfile.ZipFile(buf, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
-                fitz_doc = _fitz.open(stream=raw_pdf, filetype="pdf")
+                # Track the currently open fitz document to avoid re-opening
+                # the same PDF repeatedly when multiple split_docs share a source.
+                _current_pdf_bytes = None
+                _fitz_doc = None
                 for doc_idx, doc in enumerate(split_docs):
+                    doc_pdf_bytes = doc.get("_pdf_bytes") or raw_pdf
+                    if doc_pdf_bytes is not _current_pdf_bytes:
+                        if _fitz_doc:
+                            _fitz_doc.close()
+                        _fitz_doc = _fitz.open(stream=doc_pdf_bytes, filetype="pdf")
+                        _current_pdf_bytes = doc_pdf_bytes
                     awb_label = doc.get("awb_number") or f"DOC_{doc_idx + 1}"
+                    # In ZIP/batch mode prefix with the source PDF name for clarity
+                    if is_zip and doc.get("_pdf_name"):
+                        pdf_stem = doc["_pdf_name"].rsplit(".", 1)[0]
+                        awb_label = f"{pdf_stem}/{awb_label}"
                     rotations: dict = doc.get("page_rotations") or {}
                     s = doc.get("start_page", 1)
                     e = doc.get("end_page", s)
                     for page_num_1 in range(s, e + 1):
                         fitz_idx = page_num_1 - 1
-                        if fitz_idx >= len(fitz_doc):
+                        if fitz_idx >= len(_fitz_doc):
                             continue
-                        page = fitz_doc[fitz_idx]
+                        page = _fitz_doc[fitz_idx]
                         if page_num_1 in rotations:
                             correction = rotations[page_num_1]
                         else:
@@ -424,7 +490,8 @@ def render_pdf_upload(on_back):
                         fname = f"{awb_label}/page_{page_num_1:03d}{rot_label}.png"
                         zf.writestr(fname, png_bytes)
                         total_pages += 1
-                fitz_doc.close()
+                if _fitz_doc:
+                    _fitz_doc.close()
 
             buf.seek(0)
             st.download_button(
@@ -461,7 +528,7 @@ def render_pdf_upload(on_back):
             progress.progress(i / len(split_docs), text=f"Extracting {awb_num} ({i+1}/{len(split_docs)})...")
             try:
                 result = extractor.extract_mawb_with_hawbs(
-                    raw_pdf,
+                    doc.get("_pdf_bytes") or raw_pdf,
                     start_page=doc.get("start_page", 1),
                     end_page=doc.get("end_page", doc.get("start_page", 1)),
                     page_rotations=doc.get("page_rotations"),
@@ -469,6 +536,8 @@ def render_pdf_upload(on_back):
                 # Trust pre-validated AWB number from the splitter
                 if doc.get("awb_number"):
                     result["mawb"]["awb_number"] = doc["awb_number"]
+                # Carry the source PDF name through to the results for display
+                result["_pdf_name"] = doc.get("_pdf_name", "")
                 extracted.append(result)
             except Exception as e:
                 errors.append(f"{awb_num}: {e}")
@@ -500,7 +569,8 @@ def render_pdf_upload(on_back):
         display_hawbs = refined.get("hawbs", hawbs) if refined else hawbs
 
         hawb_badge = f" • {len(display_hawbs)} HAWB" if display_hawbs else ""
-        with st.expander(f"📦 MAWB {awb_num}{hawb_badge}", expanded=(idx == 0)):
+        pdf_badge = f"  [{result.get('_pdf_name')}]" if is_zip and result.get("_pdf_name") else ""
+        with st.expander(f"📦 MAWB {awb_num}{hawb_badge}{pdf_badge}", expanded=(idx == 0)):
             source_label = "🔮 Claude Vision (re-extracted)" if refined else "🔮 Claude Vision"
             st.success(source_label)
 
@@ -527,9 +597,10 @@ def render_pdf_upload(on_back):
                     with st.spinner(f"Re-extracting {awb_num}..."):
                         ext = get_claude_vision()
                         doc = next((d for d in split_docs if (d.get("awb_number") or "") == awb_num), None)
-                        if doc and st.session_state.get("raw_pdf_bytes"):
+                        doc_pdf_bytes = doc.get("_pdf_bytes") if doc else None
+                        if doc and doc_pdf_bytes:
                             new_result = ext.extract_mawb_with_hawbs(
-                                st.session_state["raw_pdf_bytes"],
+                                doc_pdf_bytes,
                                 start_page=doc.get("start_page", 1),
                                 end_page=doc.get("end_page", doc.get("start_page", 1)),
                                 page_rotations=doc.get("page_rotations"),
@@ -597,6 +668,8 @@ def render_pdf_upload(on_back):
         for r in results:
             row = dict(r.get("mawb", r))
             row["hawb_count"] = len(r.get("hawbs", []))
+            if is_zip and r.get("_pdf_name"):
+                row["source_pdf"] = r["_pdf_name"]
             flat_rows.append(row)
         df = pd.DataFrame(flat_rows)
         st.download_button(

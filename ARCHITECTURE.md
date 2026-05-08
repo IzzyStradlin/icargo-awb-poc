@@ -1,7 +1,7 @@
 ﻿# Architecture — iCargo AWB Intelligent Processor (PoC)
 
 > **Status:** Proof of Concept  
-> **Version:** 1.1.0  
+> **Version:** 1.2.0  
 > **Owner:** MSC Air Cargo
 
 ---
@@ -288,36 +288,52 @@ Single-page application with a simple client-side router stored in `st.session_s
 | `pdf_upload`   | `pdf_upload.py`    | Full PDF → split → Vision → compare flow |
 | `email_upload` | `email_upload.py`  | .eml intake (placeholder for extension)  |
 
+**Supported upload formats:**
+
+| Format | Behaviour |
+|--------|-----------|
+| Single `.pdf` | Processed as a single source file (existing behaviour) |
+| `.zip` archive | All `.pdf` files inside are extracted (sorted by name, `__MACOSX` entries skipped), then processed as a batch — each PDF goes through presplit + Claude Vision independently |
+
+In batch (ZIP) mode the source PDF name is displayed alongside each MAWB result and added as a `source_pdf` column in the CSV export.
+
 **Session state keys used by `pdf_upload`:**
 
-| Key                   | Type         | Description                                                   |
-|-----------------------|--------------|---------------------------------------------------------------|
-| `raw_pdf_bytes`       | `bytes`      | Current PDF file contents                                     |
-| `pdf_name`            | `str`        | Uploaded file name (used as a change detector to reset state) |
-| `split_documents`     | `list[dict]` | Pre-split result (page ranges, AWB #, `page_rotations`)       |
-| `split_mode`          | `str`        | `"fast"` or `"normale"`                                       |
-| `awb_results`         | `list[dict]` | Claude Vision extraction results                              |
-| `vision_refined_awbs` | `dict`       | Per-AWB re-extraction overrides                               |
-| `debug_page_texts`    | `dict`       | Raw page text cache for the debug panel                       |
+| Key                   | Type         | Description                                                        |
+|-----------------------|--------------|--------------------------------------------------------------------|
+| `pdf_name`            | `str`        | Uploaded file name — change detector to reset all downstream state |
+| `batch_pdfs`          | `list[dict]` | Normalised list of `{"name", "bytes"}` — one entry per PDF         |
+| `raw_pdf_bytes`       | `bytes`      | First PDF bytes (kept for single-file debug panel compatibility)   |
+| `split_documents`     | `list[dict]` | Pre-split result across all PDFs; each entry carries `_pdf_bytes` and `_pdf_name` |
+| `split_mode`          | `str`        | `"fast"` or `"normale"`                                            |
+| `awb_results`         | `list[dict]` | Claude Vision extraction results; each entry carries `_pdf_name`  |
+| `vision_refined_awbs` | `dict`       | Per-AWB re-extraction overrides                                    |
+| `debug_page_texts`    | `dict`       | Raw page text cache for the debug panel (first PDF only)           |
 
 **UI workflow (pdf_upload page):**
 
-1. **Upload** — user drops a PDF; presplit runs automatically.
-2. **🔍 Debug split** *(expander)* — raw page text + document boundaries, useful to verify the split logic without calling Claude.
-3. **🖼 Preview rendered pages** *(expander)* — renders all pages with orientation correction applied (same pipeline as Claude receives) and downloads them as a ZIP. File names include a `_rotN` suffix when a page was rotated (e.g. `page_002_rot90.png`). Use this to verify orientation before spending API credits.
-4. **🚀 Extract all with Claude Vision** — calls Claude for every detected AWB block.
-5. **Results** — MAWB + HAWB fields displayed; re-extract per AWB; download JSON; compare with iCargo.
+1. **Upload** — user drops a PDF or a ZIP; for ZIP the contained files are listed in a collapsible expander.
+2. **Pre-split** — runs automatically; processes each PDF in the batch sequentially.
+3. **🔍 Debug split** *(expander)* — raw page text + document boundaries for the first PDF (ZIP batch: labelled accordingly).
+4. **🖼 Preview rendered pages** *(expander)* — renders all pages across all PDFs with orientation correction applied and packages them into a ZIP. File names use the path `{pdf_stem}/{awb_number}/page_001_rot90.png`. Use this to verify orientation before spending API credits.
+5. **🚀 Extract all with Claude Vision** — calls Claude for every detected AWB block across all PDFs.
+6. **Results** — MAWB + HAWB fields displayed; each result shows its source PDF name in ZIP mode; re-extract per AWB; download JSON; compare with iCargo.
 
 ---
 
 ## 5. Data Flow — PDF Workflow
 
 ```
-User uploads PDF
+User uploads PDF or ZIP
        │
-       ▼
+       ▼  (_extract_pdfs_from_upload)
+[ZIP] unzip → sort PDFs by name → List[{ name, bytes }]
+[PDF] wrap as single-item list
+       │
+       ▼  (for each PDF in batch)
 AwbDocumentPreSplitter.presplit_pdf_fast / presplit_pdf_with_text
-  → List[{ awb_number, start_page, end_page, text, page_rotations }]
+  → List[{ awb_number, start_page, end_page, text, page_rotations,
+            _pdf_name, _pdf_bytes }]
   │
   │  Smart mode runs TWO parallel Tesseract tasks per scanned page:
   │    • PSM 6, OEM 1  (top 20%)   → boundary-detection text
@@ -329,11 +345,12 @@ AwbDocumentPreSplitter.presplit_pdf_fast / presplit_pdf_with_text
   │  page_rotations: { page_num → CCW_degrees }  (only non-zero entries stored)
        │
        ├──► [optional] 🖼 Preview PNG ZIP (no Claude call)
-       │         renders pages with orientation correction applied
+       │         renders pages from each source PDF with orientation correction
+       │         folder structure: {pdf_stem}/{awb_number}/page_001_rot90.png
        │         → user verifies upright images before spending credits
        │
-       ▼  (for each document)
-ClaudeVisionProvider._render_pages(pdf_bytes, start_page, end_page, page_rotations)
+       ▼  (for each document — uses doc["_pdf_bytes"] not the first-PDF shortcut)
+ClaudeVisionProvider._render_pages(doc["_pdf_bytes"], start_page, end_page, page_rotations)
   │   per page: apply OSD correction → fallback landscape heuristic → no rotation
   │   → portrait PNG, base64-encoded
        │
@@ -351,6 +368,10 @@ AwbVisionExtractor.extract_mawb_with_hawbs
                 → map_icargo_awb_ibs(icargo_raw)  → flat dict
                 → diff_awb(extracted, icargo_flat) → DiffRow list
                 → Rendered as dataframe in UI
+
+Batch (ZIP) download:
+  results list → JSON  (all MAWBs + HAWBs across all source PDFs)
+               → CSV   (one row per MAWB; includes source_pdf column)
 ```
 
 ---
@@ -454,7 +475,33 @@ CMD ["python", "-m", "app.main"]
 
 ## 12. Known Limitations & Planned Improvements
 
-### 12.1 Claude output truncation on high-HAWB documents
+### 12.1 Pre-split boundary detection on rotated PDFs
+
+**Current behaviour**  
+The Smart pre-split mode crops the **raw (uncorrected) rasterisation** to the top 20% before running Tesseract for boundary detection. If a PDF page arrives rotated (90°, 180°, or 270°), the top 20% of the raw image contains the side or footer of the form — not the IATA Box 1 header where the shipper label and AWB number appear. The shipper-marker strategy therefore finds no boundaries and the fallback AWB-number clustering is used instead (which is less reliable).
+
+The `page_rotations` dict computed during this same step is currently consumed only by `ClaudeVisionProvider._render_pages` — not by the pre-splitter itself.
+
+**Proposed fix**  
+Apply OSD rotation correction to the full rasterised page *before* cropping to the top 20%:
+
+```
+Rasterise (raw) → OSD → apply Matrix.prerotate(correction)
+                                   │
+                        ┌──────────┴──────────────────┐
+                        crop top 20%              already corrected
+                        boundary-detection OCR    → page_rotations becomes
+                                                    redundant (baked in)
+```
+
+The change is localised to `AwbDocumentPreSplitter` in the parallel-task worker. OSD is already run in the same worker, so the only structural change is making the crop happen on the corrected pixmap instead of the raw one. The additional latency is negligible (OSD completes in < 100 ms).
+
+**Impact for the current PoC**  
+PDFs generated by airline cargo systems typically arrive upright, so this limitation does not affect the 95%+ success rate observed in testing. The main risk is a silent failure mode: a fully rotated PDF causes the pre-splitter to treat all pages as a single document, and Claude then attempts to extract multiple MAWBs from one over-large image set — potentially mixing fields across AWBs.
+
+---
+
+### 12.2 Claude output truncation on high-HAWB documents
 
 **Current behaviour**  
 `extract_mawb_with_hawbs_json` sends all pages of a document (MAWB + all HAWBs) in a **single API call** with `max_tokens=8192`. When a consolidation contains many House AWBs the generated JSON can exceed this token budget. Claude truncates the response mid-JSON, producing a parse error such as:
@@ -484,4 +531,4 @@ The answer determines the batch size and whether a fixed batch of 4–5 per call
 
 ---
 
-*Document updated: May 2026 — MSC Air Cargo / iCargo PoC Team*
+*Document updated: May 2026 (v1.2.0 — ZIP batch upload) — MSC Air Cargo / iCargo PoC Team*
