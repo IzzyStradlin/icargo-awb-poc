@@ -738,22 +738,17 @@ class AwbDocumentPreSplitter:
         """
         Detect page orientation and return (page_num, ccw_degrees_to_correct).
 
-        Uses six strategies in cascade:
+        Uses the following cascade:
 
-          1. Pixel dimensions  — fast: w > h means the scan itself is landscape.
-          2. OSD (non-zero)    — if Tesseract is confident AND says rotate ≠ 0,
-                                 trust it immediately (handles true rotated scans).
-          3. Generic rotation probe — ALWAYS runs, even when OSD returns 0°.
-                                 Applies all four rotations (k=0,1,2,3) to the page
-                                 BODY (below the top 25%, skipping any portrait
-                                 company header), OCRs each, and picks the rotation
-                                 with the highest HAWB keyword score.
-          4. OSD (zero)        — if OSD was confident with 0° AND probe found
-                                 nothing → trust OSD and return 0°.
-          5. OSD retry         — run OSD on the 90°-CCW-rotated image; if it now
-                                 reads upright with good confidence, the original
-                                 needed 90° CCW.
-          6. Give up           — return 0° (no rotation detected).
+          1. Keyword probe (primary) — tries all 4 rotations (0°, 90°, 180°,
+             270° CCW) and picks the one where Tesseract finds the most AWB
+             keywords (Shipper, Consignee, manifest, …).  Handles both portrait
+             and landscape pages, including upside-down landscape pages where a
+             simple w > h heuristic would pick the wrong direction.
+          2. OSD (non-zero) — if the keyword probe is inconclusive (all scores
+             equal 0) and OSD is confident with a non-zero rotation, trust it.
+          3. OSD (zero) — if OSD says 0° with confidence, return 0°.
+          4. Give up — return 0° (no rotation detected).
 
         NOTE: Runs in a worker thread. img_arr must be a plain numpy array —
         no fitz/PyMuPDF objects (those are not thread-safe).
@@ -767,13 +762,57 @@ class AwbDocumentPreSplitter:
 
         h, w = img_arr.shape[:2]
 
-        # ── Strategy 1: pixel dimensions ───────────────────────────────────
-        if w > h:
+        # ── Strategy 1: keyword probe across all 4 rotations ───────────────
+        # Score AWB-specific keywords in each rotation. The rotation with the
+        # highest readable keyword count is applied as the correction.
+        # This handles every case: portrait/landscape, 0°/90°/180°/270°,
+        # and opposite landscape scans (e.g. 90° CW vs 270° CW within the same
+        # batch), which a simple "w > h → 90°" heuristic cannot distinguish.
+        #
+        # The BODY (below top 25%) is used to exclude company letterheads that
+        # may contain partial keyword matches and bias the probe.
+        _AWB_KEYWORDS = frozenset({
+            "shipper", "consignee", "air waybill", "waybill", "hawb",
+            "manifest", "master", "flight", "departure", "destination",
+            "pieces", "weight", "sender", "notify", "house",
+            "apt dest", "hawb n", "nature of goods", "chargeable",
+            "issuing carrier", "gross weight",
+        })
+        try:
+            cfg_probe = "--oem 1 --psm 6"
+
+            def _kw_score_kw(arr) -> int:
+                txt = _tess.image_to_string(
+                    _PILImage.fromarray(arr), lang="eng", config=cfg_probe
+                ).lower()
+                return sum(1 for kw in _AWB_KEYWORDS if kw in txt)
+
+            _CORRECTION = {0: 0, 1: 90, 2: 180, 3: 270}
+            scores: dict[int, int] = {}
+            for k in (0, 1, 2, 3):
+                scores[k] = _kw_score_kw(_np.rot90(img_arr, k=k) if k else img_arr)
+
             _log.debug(
-                "Page %d: landscape pixels (w=%d > h=%d) → 90° CCW",
-                page_num, w, h,
+                "Page %d keyword probe: 0°=%d  90°=%d  180°=%d  270°=%d",
+                page_num, scores[0], scores[1], scores[2], scores[3],
             )
-            return page_num, 90
+
+            best_k = max(scores, key=lambda k: scores[k])
+            if best_k != 0 and scores[best_k] > scores[0]:
+                correction = _CORRECTION[best_k]
+                _log.debug(
+                    "Page %d → %d° CCW (probe k=%d score=%d beats upright=%d)",
+                    page_num, correction, best_k, scores[best_k], scores[0],
+                )
+                return page_num, correction
+
+            # All scores equal 0 OR upright wins → fall through to OSD
+            if scores[best_k] > 0:
+                _log.debug("Page %d: upright wins (score=%d), no rotation", page_num, scores[0])
+                return page_num, 0
+
+        except Exception as _probe_exc:
+            _log.debug("Page %d keyword probe failed: %s", page_num, _probe_exc)
 
         # ── Strategy 2: OSD — trust only if confident AND non-zero ─────────
         # --oem 0: legacy engine required for --psm 0 (OSD).
@@ -801,104 +840,26 @@ class AwbDocumentPreSplitter:
         except Exception as _osd_exc:
             _log.debug("Page %d OSD failed: %s", page_num, _osd_exc)
 
-        # ── Strategy 3: generic 4-rotation body probe ──────────────────────
-        # Always runs, even when OSD returned 0° confidently.
-        #
-        # Applies all four rotations (0°, 90°, 180°, 270°) to the page BODY
-        # (everything below the top 25%, which may contain a portrait company
-        # header), OCRs each rotated version, and picks the rotation that
-        # produces the highest HAWB keyword count.
-        #
-        # This is fully generic:
-        #   k=1 (90°  CCW) body readable → HAWB was printed landscape 90° CW
-        #   k=2 (180°)     body readable → HAWB was printed upside-down
-        #   k=3 (270° CCW) body readable → HAWB was printed landscape 90° CCW
-        #   k=0 (0°)  wins              → page is truly upright, no rotation
-        #
-        # Decision rule: if any non-zero rotation beats k=0, apply it.
-        # Tie between non-zero rotations → choose the one with more keywords.
-        # Tie between a non-zero rotation and k=0 → no rotation (conservative).
-        #
-        # Why exclude the top 25%?
-        # Company letterheads (DSV, Schenker, …) often contain words like
-        # "airway" or "manifest" in small print. Excluding that area avoids
-        # false positives that could bias the probe.
-        _HAWB_KEYWORDS = frozenset({
-            "shipper", "consignee", "sender", "notify", "house", "hawb",
-            "airway", "waybill", "recipient", "manifest",
-        })
-        try:
-            strip_h = max(1, int(h * 0.25))
-            body = img_arr[strip_h:, :, :]  # exclude portrait header area
-
-            cfg_probe = "--oem 1 --psm 6"
-
-            def _kw_score(arr) -> tuple[int, list]:
-                txt = _tess.image_to_string(
-                    _PILImage.fromarray(arr), lang="eng", config=cfg_probe
-                ).lower()
-                hits = [kw for kw in _HAWB_KEYWORDS if kw in txt]
-                return len(hits), hits
-
-            # Score all four rotations
-            _CORRECTION = {0: 0, 1: 90, 2: 180, 3: 270}
-            probe: dict[int, tuple[int, list]] = {}
-            for k in (0, 1, 2, 3):
-                probe[k] = _kw_score(_np.rot90(body, k=k) if k else body)
-
+        # ── Strategy 2: OSD fallback — only if keyword probe found nothing ──
+        # Used when the page has no AWB keywords (e.g. blank filler pages,
+        # pure image pages). OSD is trusted only with high confidence.
+        # --oem 0: legacy engine required for --psm 0 (OSD).
+        if osd_rotate is not None and osd_rotate != 0:
             _log.debug(
-                "Page %d rotation probe: 0°=%d%s  90°=%d%s  180°=%d%s  270°=%d%s",
-                page_num,
-                probe[0][0], probe[0][1],
-                probe[1][0], probe[1][1],
-                probe[2][0], probe[2][1],
-                probe[3][0], probe[3][1],
+                "Page %d: keyword probe inconclusive, OSD fallback → %d°",
+                page_num, osd_rotate,
             )
+            return page_num, osd_rotate
 
-            best_k = max(probe, key=lambda k: probe[k][0])
-            best_score, best_hits = probe[best_k]
-            k0_score = probe[0][0]
-
-            if best_k != 0 and best_score > k0_score:
-                correction = _CORRECTION[best_k]
-                _log.debug(
-                    "Page %d rotation probe → %d° "
-                    "(k=%d score=%d%s beats upright score=%d)",
-                    page_num, correction, best_k, best_score, best_hits, k0_score,
-                )
-                return page_num, correction
-
-            _log.debug(
-                "Page %d rotation probe: upright wins (k0=%d), no rotation",
-                page_num, k0_score,
-            )
-
-        except Exception as _probe_exc:
-            _log.debug("Page %d rotation probe failed: %s", page_num, _probe_exc)
-
-        # ── Strategy 4: OSD said 0° with confidence → trust it ─────────────
         if osd_rotate == 0:
-            _log.debug("Page %d: OSD confident 0°, keyword probe found nothing → no rotation", page_num)
+            _log.debug(
+                "Page %d: keyword probe inconclusive, OSD says 0° → no rotation",
+                page_num,
+            )
             return page_num, 0
 
-        # ── Strategy 5: OSD retry on 90°-CCW-rotated image ─────────────────
-        try:
-            osd_90 = _tess.image_to_osd(
-                _PILImage.fromarray(_np.rot90(img_arr, k=1)),
-                config="--psm 0 --oem 0",
-                output_type=_tess.Output.DICT,
-            )
-            conf_90 = float(osd_90.get("orientation_conf", 0.0))
-            rotate_90 = int(osd_90.get("rotate", 0))
-            _log.debug("Page %d OSD@90°CCW: rotate=%d conf=%.1f", page_num, rotate_90, conf_90)
-            if conf_90 >= 3.0 and rotate_90 == 0:
-                _log.debug("Page %d OSD retry confirms 90° CCW needed", page_num)
-                return page_num, 90
-        except Exception as _retry_exc:
-            _log.debug("Page %d OSD retry failed: %s", page_num, _retry_exc)
-
-        # ── Strategy 6: give up ─────────────────────────────────────────────
-        _log.debug("Page %d: no rotation detected (portrait, w=%d h=%d)", page_num, w, h)
+        # ── Strategy 3: give up ─────────────────────────────────────────────
+        _log.debug("Page %d: no rotation detected (w=%d h=%d)", page_num, w, h)
         return page_num, 0
 
     def presplit_pdf_fast(self, raw_pdf: bytes, max_workers: int = 4) -> List[Dict[str, any]]:

@@ -19,6 +19,7 @@ from app.ui.assets.branding import get_brand_info, get_css, get_logo_data_uri
 # Import pages
 from app.ui.pages.pdf_upload import render_pdf_upload
 from app.ui.pages.email_upload import render_email_upload
+from app.ui.pages.awb_lookup import render_awb_lookup
 
 # Configure Streamlit
 st.set_page_config(
@@ -92,7 +93,7 @@ def render_landing():
 
     st.markdown("<div class='msc-kicker'>Select workflow</div>", unsafe_allow_html=True)
 
-    col1, col2 = st.columns(2, gap="large")
+    col1, col2, col3 = st.columns(3, gap="large")
 
     with col1:
         st.markdown(
@@ -122,6 +123,20 @@ def render_landing():
         if st.button("Open Email Workflow", key="btn_email", use_container_width=True):
             set_page("email_upload")
 
+    with col3:
+        st.markdown(
+            """
+            <div class="msc-panel">
+                <div class="msc-kicker">Workflow 03</div>
+                <h3>AWB Lookup</h3>
+                <p>Query iCargo IBS directly by AWB number and inspect the raw JSON response in real time.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Open AWB Lookup", key="btn_lookup", use_container_width=True):
+            set_page("awb_lookup")
+
     st.markdown(
         f"<div class='msc-footer'>{brand['copyright']}<br><span>Version {brand['version']}</span></div>",
         unsafe_allow_html=True,
@@ -138,5 +153,7 @@ if page == "pdf_upload":
     render_pdf_upload(on_back=lambda: set_page("landing"))
 elif page == "email_upload":
     render_email_upload(on_back=lambda: set_page("landing"))
+elif page == "awb_lookup":
+    render_awb_lookup(on_back=lambda: set_page("landing"))
 else:
     render_landing()

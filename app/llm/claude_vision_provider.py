@@ -24,29 +24,32 @@ I am showing you one or more images of an Air Waybill form.
 Extract ALL of the following fields and return ONLY a valid JSON object — no markdown, no code fences, no explanation.
 
 == FORM LAYOUT ==
-The AWB has a 2-column layout:
-  - LEFT column  → Shipper information
-  - RIGHT column → Consignee information
+The standard IATA AWB form has the following box structure, reading top-to-bottom on the LEFT side:
+  - TOP-LEFT box    (labeled "Shipper's Name and Address")          → SHIPPER
+  - BELOW shipper   (labeled "Consignee's Name and Address")        → CONSIGNEE
+  - BELOW consignee (labeled "Issuing Carrier's Agent Name and City") → AGENT (freight forwarder)
+The RIGHT column contains "Not Negotiable Air Waybill — Issued by [Carrier name]" — this is the AIRLINE/CARRIER, NOT the agent.
+CRITICAL: "agent" must come from the "Issuing Carrier's Agent Name and City" box (left side), NOT from the "Issued by" box (right side).
 The routing / To-By table row format is: DESTINATION (3 letters) | CARRIER (2 letters) | FLIGHT/DATE
 Example: "HKG | CP | 113/19"  →  flight_number = "CP113", destination = "HKG"
 
 == FIELDS (use exactly these JSON keys, set null if not found) ==
 awb_number        — format NNN-NNNNNNNN (e.g. 233-10166763)
-origin            — IATA 3-letter departure airport code
-destination       — IATA 3-letter destination airport code
+origin            — IATA 3-letter airport code from the "Airport of Departure" field (top-left area, below the AWB number). Convert the city/airport name to its IATA code (e.g. "MALPENSA APT/MILANO" → "MXP", "HONG KONG" → "HKG").
+destination       — IATA 3-letter airport code from the "Airport of Destination" field OR the first entry in the "To" column of the routing table (whichever is present). Do NOT swap origin and destination.
 shipper           — full company name from "Shipper's Name and Address" box (top-left)
 shipper_street    — street address of shipper
 shipper_city      — city of shipper
 shipper_province  — province/state of shipper
 shipper_zip       — postal code of shipper
 shipper_country   — 2-letter ISO country code of shipper
-consignee         — full company name from "Consignee's Name and Address" box (top-right)
+consignee         — full company name from "Consignee's Name and Address" box (LEFT side, below shipper)
 consignee_street  — street address of consignee
 consignee_city    — city of consignee
 consignee_province— province/state of consignee
 consignee_zip     — postal code of consignee
 consignee_country — 2-letter ISO country code of consignee
-agent             — company name from "Issuing Carrier's Agent Name and City" box
+agent             — company name from "Issuing Carrier's Agent Name and City" box (LEFT side, below consignee) — this is the freight forwarder, NOT the airline. Do NOT use the "Issued by" box (right side) for this field.
 agent_street      — street address of agent
 agent_city        — city of agent
 agent_province    — province/state of agent
@@ -81,15 +84,24 @@ Extract ALL fields and return ONLY a valid JSON object with this exact structure
 
 hawbs must be an array (empty [] if no HAWBs found).
 
+== IATA MAWB FORM LAYOUT ==
+The standard IATA AWB form has these boxes on the LEFT side, stacked top-to-bottom:
+  - TOP-LEFT box    (labeled "Shipper's Name and Address")            → SHIPPER
+  - BELOW shipper   (labeled "Consignee's Name and Address")          → CONSIGNEE
+  - BELOW consignee (labeled "Issuing Carrier's Agent Name and City") → AGENT (freight forwarder)
+The RIGHT column contains "Not Negotiable Air Waybill — Issued by [Carrier name]" — this is the AIRLINE/CARRIER, NOT the agent.
+CRITICAL: the `agent` field must be read from the "Issuing Carrier's Agent Name and City" box (left side), NOT from the "Issued by" box (right side).
+Always read the printed box label on the form to identify each field.
+
 == MAWB FIELDS (under "mawb" key) ==
 awb_number        — MAWB number, format NNN-NNNNNNNN (e.g. 233-10166763)
-origin            — IATA 3-letter departure airport
-destination       — IATA 3-letter destination airport
+origin            — IATA 3-letter code from the "Airport of Departure" field (below the AWB number). Convert airport/city name to IATA code (e.g. "MALPENSA APT/MILANO" → "MXP").
+destination       — IATA 3-letter code from the "Airport of Destination" field OR the first "To" column entry in the routing table. Do NOT swap origin and destination.
 shipper           — shipper company name
 shipper_street / shipper_city / shipper_province / shipper_zip / shipper_country
 consignee         — consignee company name
 consignee_street / consignee_city / consignee_province / consignee_zip / consignee_country
-agent             — issuing carrier's agent name
+agent             — company name from "Issuing Carrier's Agent Name and City" box (LEFT side, below consignee — freight forwarder, NOT the airline in the "Issued by" box)
 agent_street / agent_city / agent_province / agent_zip / agent_country
 pieces            — total number of pieces (integer)
 weight            — total gross weight in kg (numeric)
@@ -217,9 +229,43 @@ class ClaudeVisionProvider:
                 correction = rotations[page_num_1based]
                 _log.debug("Page %d: OSD-based rotation=%d°", page_num_1based, correction)
             else:
-                # Fallback heuristic: landscape → assume 90° CW scan, correct CCW
-                rect = page.bound()  # accounts for PDF /Rotate flag
-                correction = 90 if rect.width > rect.height else 0
+                # Fallback: landscape page with no OSD data.
+                # Probe 90° CCW vs 270° CCW to avoid blind inversion.
+                rect = page.bound()
+                if rect.width > rect.height:
+                    try:
+                        import pytesseract as _tess
+                        from PIL import Image as _PIL
+                        import numpy as _np
+                        import fitz as _fitz
+                        _KWDS = frozenset({
+                            "shipper", "consignee", "hawb", "airway",
+                            "waybill", "manifest", "master", "flight",
+                        })
+                        _cfg = "--oem 1 --psm 6"
+
+                        def _score_rotation(deg: int) -> int:
+                            _mat = _fitz.Matrix(1.5, 1.5).prerotate(deg)
+                            _pix = page.get_pixmap(matrix=_mat, colorspace=_fitz.csRGB)
+                            _arr = _np.frombuffer(_pix.samples, dtype=_np.uint8).reshape(
+                                _pix.height, _pix.width, 3
+                            )
+                            txt = _tess.image_to_string(
+                                _PIL.fromarray(_arr), lang="eng", config=_cfg
+                            ).lower()
+                            return sum(1 for kw in _KWDS if kw in txt)
+
+                        s90  = _score_rotation(90)
+                        s270 = _score_rotation(270)
+                        correction = 90 if s90 >= s270 else 270
+                        _log.debug(
+                            "Page %d landscape fallback probe: 90°=%d 270°=%d → %d°",
+                            page_num_1based, s90, s270, correction,
+                        )
+                    except Exception:
+                        correction = 90  # last resort
+                else:
+                    correction = 0
                 _log.debug(
                     "Page %d: heuristic rotation=%d° (bound w=%.0f h=%.0f)",
                     page_num_1based, correction, rect.width, rect.height,
