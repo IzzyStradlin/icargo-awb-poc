@@ -1,7 +1,7 @@
 ﻿# Architecture — iCargo AWB Intelligent Processor (PoC)
 
 > **Status:** Proof of Concept  
-> **Version:** 1.2.0  
+> **Version:** 1.3.0  
 > **Owner:** MSC Air Cargo
 
 ---
@@ -181,18 +181,21 @@ Each MAWB page range is converted to PNG images (via PyMuPDF/fitz) and sent to *
 **Key design decisions:**
 - No intermediate OCR text is sent to Claude — images are sent directly, preserving the 2-column IATA AWB layout that regex cannot reliably parse.
 - A structured JSON prompt instructs Claude to return exactly the AWB schema fields (`awb_number`, `shipper`, `consignee`, `origin`, `destination`, `flight_number`, `pieces`, `weight`, …).
-- **Orientation correction** — before base64-encoding, `ClaudeVisionProvider._render_pages` applies `fitz.Matrix(1.5, 1.5).prerotate(correction)` per page, where `correction` (CCW degrees) comes from `page_rotations` when available, or from a dimension heuristic (`w > h` → 90° CCW) as a fallback. This ensures Claude always receives upright images regardless of scan orientation.
+- **Orientation correction** — before base64-encoding, `ClaudeVisionProvider._render_pages` applies `fitz.Matrix(1.5, 1.5).prerotate(correction)` per page, where `correction` (CCW degrees) comes from:
+1. `page_rotations[page]` (presplitter keyword-probe result) if present — highest priority.
+2. PDF content-stream text-direction (rawdict `dir` vectors) for digitally-generated PDFs.
+3. Pixel gradient score (row variance / column variance of dark pixels) comparing 0° and 90° — with carry-forward from the previous page when ambiguous.
+
+PyMuPDF automatically applies the page's `/Rotate` entry before rendering, so correction angles are always relative to that already-normalised image.
 
 **Rotation detection cascade (`_detect_rotation_page`):**
 
 | Priority | Strategy | Trigger |
 |---|---|---|
-| 1 | **Pixel dimensions** | `w > h` (pixmap is landscape) → 90° CCW immediately |
-| 2 | **OSD non-zero** (`--psm 0 --oem 0`) | `orientation_conf ≥ 3.0` **and** `rotate ≠ 0` → trust immediately |
-| 3 | **Generic rotation probe** | Always runs — scores all 4 rotations on the page body |
-| 4 | **OSD zero** | OSD was confident 0° **and** probe found nothing → return 0° |
-| 5 | **OSD retry on pre-rotated image** | Rotate 90° CCW, re-run OSD; if `conf ≥ 3.0` and `rotate=0` → original needed 90° CCW |
-| 6 | **Give up** | Return 0° (no rotation detected) |
+| 1 | **Keyword probe** (primary) | Runs Tesseract at all 4 rotations (0°, 90°, 180°, 270°) on page body (below top 25%); picks the rotation with the highest AWB keyword count. Requires ≥ 2 keyword matches to override upright. |
+| 2 | **OSD non-zero** (`--psm 0 --oem 0`) | Runs only if keyword probe is inconclusive (all scores = 0). `orientation_conf ≥ 3.0` **and** `rotate ≠ 0` → trust immediately. |
+| 3 | **OSD zero** | OSD was confident 0° → return 0° |
+| 4 | **Give up** | Return 0° (no rotation detected, deferred to gradient in render step) |
 
 **Strategy 3 — Generic rotation probe:**
 
@@ -214,19 +217,23 @@ best k=3 (270° CCW readable) → HAWB printed landscape 90° CCW → correction
 best k=0 (upright wins)      → page is truly portrait         → no rotation
 ```
 
-HAWB keywords scored: `shipper`, `consignee`, `sender`, `notify`, `house`, `hawb`, `airway`, `waybill`, `recipient`, `manifest`. Decision rule: any non-zero k with more hits than k=0 wins; ties between two non-zero rotations are broken by hit count (then by k order).
+AWB keywords scored: `shipper`, `consignee`, `air waybill`, `waybill`, `hawb`, `manifest`, `master`, `flight`, `departure`, `destination`, `pieces`, `weight`, `sender`, `notify`, `house`, `apt dest`, `hawb n`, `nature of goods`, `chargeable`, `issuing carrier`, `gross weight`. Decision rule: the rotation with the highest keyword count wins, provided it scores ≥ 2 keywords; ties resolve via k order (lower k preferred).
+
+**Coordinate system note:** numpy and fitz (PDF math) have opposite y-axis directions. The `_CORRECTION` mapping accounts for this:
+
+| numpy `rot90(k)` | Screen result | Correct fitz correction |
+|---|---|---|
+| k=1 | 90° CCW | `fitz.prerotate(270)` |
+| k=2 | 180° | `fitz.prerotate(180)` |
+| k=3 | 90° CW | `fitz.prerotate(90)` |
 
 OSD notes:
-- `--oem 0` (legacy engine) is mandatory for `--psm 0`; `--oem 1` (LSTM) is silently incompatible with OSD and always returned 0° with high confidence on low-text pages.
+- `--oem 0` (legacy engine) is mandatory for `--psm 0`; `--oem 1` (LSTM) is silently incompatible with OSD.
 - Results with `orientation_conf < 3.0` are discarded.
 
-> **Known failure mode (fixed — `--oem` bug):** using `--oem 1` with PSM 0 caused OSD to fail silently on low-text pages, always returning 0°. Fixed by switching to `--oem 0`.
+**Render-step fallback (gradient orientation):** for pages where the presplitter found no rotation (sparse pages, e.g. a near-empty final AMS Manifest page), `_render_pages` compares pixel gradient scores at 0° and 90° and carries forward the last known correction within the same document if ambiguous.
 
-> **Known failure mode (fixed — early-return structural bug):** OSD returning 0° with high confidence caused an immediate return before the rotation probe ran (probe was unreachable in the `except` branch). Fixed by restructuring the cascade so the probe always runs as Strategy 3 regardless of OSD confidence.
-
-> **Known failure mode (fixed — strip-based probe fragility):** an earlier left/right strip approach was brittle and produced several 90°/180°/270° inversions. Replaced by the generic 4-rotation body probe, which is correct by construction.
-
-> **Known limitation — 90° vs 270° ambiguity:** when a landscape page is symmetric (e.g. a single-row manifest table), the probe may score k=1 and k=3 equally and pick a direction arbitrarily. In practice, Claude Vision has shown robustness to 180° misalignments (observed empirically in one production test), though this is not a guaranteed behaviour.
+**Presplitter carry-forward:** `presplit_pdf_fast` propagates detected rotation to subsequent pages within the same document that had no own detection result. This is scoped to the document boundary to prevent contaminating the next MAWB block.
 
 **Other rendering parameters:**
 - Safety cap: max 20 images per API call (overridable via `max_images`).
@@ -475,29 +482,14 @@ CMD ["python", "-m", "app.main"]
 
 ## 12. Known Limitations & Planned Improvements
 
-### 12.1 Pre-split boundary detection on rotated PDFs
+### 12.1 ~~Pre-split boundary detection on rotated PDFs~~ — **RESOLVED (v1.3.0)**
 
-**Current behaviour**  
-The Smart pre-split mode crops the **raw (uncorrected) rasterisation** to the top 20% before running Tesseract for boundary detection. If a PDF page arrives rotated (90°, 180°, or 270°), the top 20% of the raw image contains the side or footer of the form — not the IATA Box 1 header where the shipper label and AWB number appear. The shipper-marker strategy therefore finds no boundaries and the fallback AWB-number clustering is used instead (which is less reliable).
+**Root cause (resolved):** the keyword probe in `_detect_rotation_page` used an incorrect coordinate-system mapping between numpy and fitz. `np.rot90(k=3)` = 90° CW on screen = `fitz.prerotate(90)`, not 270° as the original mapping assumed. For sparse pages (e.g. a near-empty AMS Manifest final page), the probe selected `k=3` (highest keyword score in that orientation) and converted it to `270°`, producing a 180° inversion — the page appeared upside-down in Claude's input.
 
-The `page_rotations` dict computed during this same step is currently consumed only by `ClaudeVisionProvider._render_pages` — not by the pre-splitter itself.
-
-**Proposed fix**  
-Apply OSD rotation correction to the full rasterised page *before* cropping to the top 20%:
-
-```
-Rasterise (raw) → OSD → apply Matrix.prerotate(correction)
-                                   │
-                        ┌──────────┴──────────────────┐
-                        crop top 20%              already corrected
-                        boundary-detection OCR    → page_rotations becomes
-                                                    redundant (baked in)
-```
-
-The change is localised to `AwbDocumentPreSplitter` in the parallel-task worker. OSD is already run in the same worker, so the only structural change is making the crop happen on the corrected pixmap instead of the raw one. The additional latency is negligible (OSD completes in < 100 ms).
-
-**Impact for the current PoC**  
-PDFs generated by airline cargo systems typically arrive upright, so this limitation does not affect the 95%+ success rate observed in testing. The main risk is a silent failure mode: a fully rotated PDF causes the pre-splitter to treat all pages as a single document, and Claude then attempts to extract multiple MAWBs from one over-large image set — potentially mixing fields across AWBs.
+**Fix applied:**
+- `_CORRECTION = {0: 0, 1: 270, 2: 180, 3: 90}` in `_detect_rotation_page` (corrects numpy ↔ fitz axis inversion).
+- `presplit_pdf_fast` now propagates detected rotation to subsequent pages within the same document (`page_rotations` carry-forward, scoped to document boundary).
+- `_render_pages` gradient fallback uses carry-forward from the previous page when both 0° and 90° gradient scores are ambiguous (instead of arbitrarily choosing 90°).
 
 ---
 
@@ -531,4 +523,4 @@ The answer determines the batch size and whether a fixed batch of 4–5 per call
 
 ---
 
-*Document updated: May 2026 (v1.2.0 — ZIP batch upload) — MSC Air Cargo / iCargo PoC Team*
+*Document updated: May 2026 (v1.3.0 — rotation fix: numpy↔fitz coordinate mapping, presplitter carry-forward, gradient fallback) — MSC Air Cargo / iCargo PoC Team*

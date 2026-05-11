@@ -60,3 +60,13 @@ class ICargoIBSClient:
             r = client.get(url, headers=self._headers())
             r.raise_for_status()
             return r.json()
+
+    def get_hawbs(self, mawb_code: str) -> dict:
+        """Retrieve all House AWBs linked to a Master AWB.
+        Endpoint: GET /v2/awbs/{awb}/hawbs
+        """
+        url = f"{self.base_url}/icargo-api/m4/enterprise/v2/awbs/{mawb_code}/hawbs"
+        with httpx.Client(timeout=self.timeout) as client:
+            r = client.get(url, headers=self._headers())
+            r.raise_for_status()
+            return r.json()

@@ -113,7 +113,18 @@ flight_date       — flight date in YYYY-MM-DD
 goods_description — full description of goods
 
 == HAWB FIELDS (each element in "hawbs" array) ==
-hawb_number          — House AWB number (any format, e.g. HAWB-12345 or 123-45678901)
+IMPORTANT — TWO HAWB DOCUMENT FORMATS exist:
+  A) Individual HAWB form: a dedicated AWB-style form document; read field-by-field.
+  B) AMS MANIFEST (table format): a multi-row table titled "AMS Manifest".
+     In format B, EACH data row is a separate House AWB — extract EACH row as a distinct HAWB entry in the array.
+     Typical AMS Manifest column order (left-to-right on the page when correctly oriented):
+       Master AWB | HAWB N. | DEP | PCS | G.Weight | Shipper | Consignee | DEST | Nature of Goods (HTS)
+     "G.Weight" = gross weight in kg  |  "PCS" = number of pieces  |  "DEP" = departure IATA airport  |  "DEST" = destination IATA airport
+
+hawb_number          — House AWB number. Copy the COMPLETE value character-by-character.
+                       CRITICAL: codes like "MIL20788320" must include ALL digits — do NOT drop the digit(s)
+                       that appear between a letter prefix and the numeric sequence (e.g. write "MIL20788320",
+                       NOT "MIL0788320"). If unsure, re-read the cell carefully before writing the value.
 origin               — IATA 3-letter departure airport
 destination          — IATA 3-letter destination airport
 shipper              — shipper company name
@@ -219,57 +230,94 @@ class ClaudeVisionProvider:
         # Example: set DEBUG_SAVE_IMAGES=C:\tmp\awb_debug in the environment.
         debug_dir = os.getenv("DEBUG_SAVE_IMAGES")
 
+        _prev_correction: int = 0  # carry-forward for sparse/ambiguous pages
+
         for p in range(fitz_start, min(fitz_end + 1, total)):
             page = doc[p]
             page_num_1based = p + 1  # match presplitter convention
 
-            # Determine correction angle (CCW degrees for fitz.Matrix.prerotate)
-            if page_num_1based in rotations:
-                # Tesseract OSD told us exactly how much to rotate
+            # ── Step 0: text-direction via rawdict (content-stream rotation) ──
+            # PyMuPDF's get_pixmap() ALREADY applies /Rotate — do NOT add it again.
+            # What it does NOT correct: pages where the content stream itself was
+            # drawn with an inverted CTM (e.g. DSV AMS Manifest from carrier system).
+            # For those, line "dir" in rawdict reveals the true writing direction
+            # BEFORE any /Rotate normalisation.
+            # dir=(-1,0) → 180°,  dir=(0,-1) → 90°,  dir=(0,1) → 270°.
+            _text_dir_correction = 0
+            try:
+                from collections import Counter as _Counter
+                _DIR_TO_CCW = {(1, 0): 0, (-1, 0): 180, (0, -1): 90, (0, 1): 270}
+                _dirs = []
+                for _block in page.get_text("rawdict").get("blocks", []):
+                    for _line in _block.get("lines", []):
+                        # Use line-level dir (more reliable than span-level in rawdict)
+                        _d = _line.get("dir", (1, 0))
+                        if _line.get("spans"):  # only count lines that have text
+                            _dirs.append((round(_d[0]), round(_d[1])))
+                if _dirs:
+                    _most_common, _cnt = _Counter(_dirs).most_common(1)[0]
+                    _log.debug(
+                        "Page %d: rawdict dominant dir=%s (%d/%d lines)",
+                        page_num_1based, _most_common, _cnt, len(_dirs),
+                    )
+                    if _cnt >= len(_dirs) * 0.6:
+                        _text_dir_correction = _DIR_TO_CCW.get(_most_common, 0)
+            except Exception as _e:
+                _log.debug("Page %d: rawdict dir check failed: %s", page_num_1based, _e)
+
+            # Determine correction angle with priority:
+            #   0. Text-direction from rawdict  (digital PDFs with embedded text)
+            #   1. OSD result from presplitter  (if Tesseract is available)
+            #   2. Gradient orientation: compare score(0°) vs score(90°) individually
+            #      (NOT pair sums — those are always equal due to a mathematical identity)
+            if _text_dir_correction != 0:
+                correction = _text_dir_correction
+                _log.debug("Page %d: text-direction → %d°", page_num_1based, correction)
+            elif page_num_1based in rotations:
                 correction = rotations[page_num_1based]
-                _log.debug("Page %d: OSD-based rotation=%d°", page_num_1based, correction)
+                _log.debug("Page %d: OSD-based → %d°", page_num_1based, correction)
             else:
-                # Fallback: landscape page with no OSD data.
-                # Probe 90° CCW vs 270° CCW to avoid blind inversion.
-                rect = page.bound()
-                if rect.width > rect.height:
-                    try:
-                        import pytesseract as _tess
-                        from PIL import Image as _PIL
-                        import numpy as _np
-                        import fitz as _fitz
-                        _KWDS = frozenset({
-                            "shipper", "consignee", "hawb", "airway",
-                            "waybill", "manifest", "master", "flight",
-                        })
-                        _cfg = "--oem 1 --psm 6"
+                # Gradient orientation (Tesseract-free, works on scanned pages).
+                # PyMuPDF auto-applies /Rotate, so deg=0 is whatever PyMuPDF produces.
+                # score = row_var / col_var of dark pixels:
+                #   HIGH → horizontal structure dominates (text/lines run L→R) → good
+                #   LOW  → vertical structure dominates (content is sideways)
+                # Rule: if score(90°) > score(0°) * 1.15 → need correction=90
+                #        if score(0°) > score(90°) * 1.15 → no correction
+                #        otherwise (sparse/ambiguous) → carry forward from previous page
+                correction = _prev_correction  # safe default
+                try:
+                    import numpy as _np
+                    import fitz as _fitz2
 
-                        def _score_rotation(deg: int) -> int:
-                            _mat = _fitz.Matrix(1.5, 1.5).prerotate(deg)
-                            _pix = page.get_pixmap(matrix=_mat, colorspace=_fitz.csRGB)
-                            _arr = _np.frombuffer(_pix.samples, dtype=_np.uint8).reshape(
-                                _pix.height, _pix.width, 3
-                            )
-                            txt = _tess.image_to_string(
-                                _PIL.fromarray(_arr), lang="eng", config=_cfg
-                            ).lower()
-                            return sum(1 for kw in _KWDS if kw in txt)
-
-                        s90  = _score_rotation(90)
-                        s270 = _score_rotation(270)
-                        correction = 90 if s90 >= s270 else 270
-                        _log.debug(
-                            "Page %d landscape fallback probe: 90°=%d 270°=%d → %d°",
-                            page_num_1based, s90, s270, correction,
+                    def _gscore(pix_obj) -> float:
+                        _arr = _np.frombuffer(pix_obj.samples, dtype=_np.uint8).reshape(
+                            pix_obj.height, pix_obj.width, 3
                         )
-                    except Exception:
-                        correction = 90  # last resort
-                else:
-                    correction = 0
-                _log.debug(
-                    "Page %d: heuristic rotation=%d° (bound w=%.0f h=%.0f)",
-                    page_num_1based, correction, rect.width, rect.height,
-                )
+                        _dark = (_arr.mean(axis=2) < 180).astype(_np.float32)
+                        _cv = float(_dark.sum(axis=0).var())
+                        return float(_dark.sum(axis=1).var()) / (_cv if _cv > 0 else 1.0)
+
+                    _lm = _fitz2.Matrix(0.75, 0.75)
+                    _s0 = _gscore(page.get_pixmap(matrix=_lm, colorspace=_fitz2.csRGB))
+                    _s90 = _gscore(page.get_pixmap(matrix=_lm.prerotate(90), colorspace=_fitz2.csRGB))
+
+                    _THRESH = 1.15
+                    if _s90 > _s0 * _THRESH:
+                        correction = 90
+                    elif _s0 > _s90 * _THRESH:
+                        correction = 0
+                    # else: ambiguous → keep _prev_correction (carry-forward)
+
+                    _log.debug(
+                        "Page %d gradient: s0=%.3f s90=%.3f → correction=%d°",
+                        page_num_1based, _s0, _s90, correction,
+                    )
+                except Exception as _e:
+                    _log.debug("Page %d gradient failed: %s", page_num_1based, _e)
+                    # keep carry-forward
+
+            _prev_correction = correction
 
             if correction != 0:
                 mat = fitz.Matrix(1.5, 1.5).prerotate(correction)
@@ -311,7 +359,17 @@ class ClaudeVisionProvider:
                     json=payload,
                 )
                 resp.raise_for_status()
-                return resp.json()["content"][0]["text"]
+                data = resp.json()
+                stop_reason = data.get("stop_reason", "unknown")
+                if stop_reason == "max_tokens":
+                    _log.warning(
+                        "Claude response was TRUNCATED (stop_reason=max_tokens, "
+                        "max_tokens=%d) — increase max_tokens to get the full response",
+                        max_tokens,
+                    )
+                else:
+                    _log.debug("Claude stop_reason=%s", stop_reason)
+                return data["content"][0]["text"]
             except httpx.HTTPStatusError as e:
                 last_err = e
                 try:
@@ -436,7 +494,7 @@ class ClaudeVisionProvider:
             })
         content.append({"type": "text", "text": _MAWB_HAWB_PROMPT})
 
-        return self._call_api(content, max_tokens=8192)
+        return self._call_api(content, max_tokens=16000)
 
     def extract_from_text(self, ocr_text: str) -> str:
         """

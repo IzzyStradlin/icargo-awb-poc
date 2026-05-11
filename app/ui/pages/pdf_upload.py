@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import zipfile
 from typing import Optional
 
@@ -19,7 +20,7 @@ from dotenv import load_dotenv
 from app.extraction.pdf_text_extractor import PDFTextExtractor
 from app.extraction.awb_document_presplitter import AwbDocumentPreSplitter
 from app.interpretation.awb_vision_extractor import AwbVisionExtractor
-from app.compare.awb_diff_ibs import map_icargo_awb_ibs, diff_awb
+from app.compare.awb_diff_ibs import map_icargo_awb_ibs, diff_awb, map_icargo_hawb_ibs, diff_hawb
 from app.ui.assets.branding import get_colors, get_brand_info
 
 load_dotenv()
@@ -64,6 +65,13 @@ class ICargoIBSClient:
         r = requests.get(url, headers=self._headers(), timeout=self.timeout)
         if r.status_code != 200:
             raise RuntimeError(f"Error GET AWB: {r.status_code} {r.text}")
+        return r.json()
+
+    def get_hawbs(self, mawb_code: str) -> dict:
+        url = f"{self.base_url}/icargo-api/m4/enterprise/v2/awbs/{mawb_code}/hawbs"
+        r = requests.get(url, headers=self._headers(), timeout=self.timeout)
+        if r.status_code != 200:
+            raise RuntimeError(f"Error GET HAWBs: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -473,6 +481,7 @@ def render_pdf_upload(on_back):
                     rotations: dict = doc.get("page_rotations") or {}
                     s = doc.get("start_page", 1)
                     e = doc.get("end_page", s)
+                    _prev_correction = 0  # carry-forward for ambiguous pages within this doc
                     for page_num_1 in range(s, e + 1):
                         fitz_idx = page_num_1 - 1
                         if fitz_idx >= len(_fitz_doc):
@@ -481,8 +490,28 @@ def render_pdf_upload(on_back):
                         if page_num_1 in rotations:
                             correction = rotations[page_num_1]
                         else:
-                            rect = page.bound()
-                            correction = 90 if rect.width > rect.height else 0
+                            # Gradient orientation: compare score(0°) vs score(90°) directly.
+                            # (Pair sums are always equal — mathematical identity.)
+                            correction = _prev_correction  # carry-forward default
+                            try:
+                                import numpy as _np
+
+                                def _gscore(px):
+                                    a = _np.frombuffer(px.samples, dtype=_np.uint8).reshape(px.height, px.width, 3)
+                                    d = (a.mean(axis=2) < 180).astype(_np.float32)
+                                    cv = float(d.sum(axis=0).var())
+                                    return float(d.sum(axis=1).var()) / (cv if cv > 0 else 1.0)
+
+                                _lm = _fitz.Matrix(0.75, 0.75)
+                                _s0 = _gscore(page.get_pixmap(matrix=_lm, colorspace=_fitz.csRGB))
+                                _s90 = _gscore(page.get_pixmap(matrix=_lm.prerotate(90), colorspace=_fitz.csRGB))
+                                if _s90 > _s0 * 1.15:
+                                    correction = 90
+                                elif _s0 > _s90 * 1.15:
+                                    correction = 0
+                            except Exception:
+                                pass  # keep carry-forward
+                        _prev_correction = correction
                         mat = _fitz.Matrix(1.5, 1.5).prerotate(correction) if correction else _fitz.Matrix(1.5, 1.5)
                         pix = page.get_pixmap(matrix=mat, colorspace=_fitz.csRGB)
                         png_bytes = pix.tobytes("png")
@@ -629,22 +658,145 @@ def render_pdf_upload(on_back):
 
             st.divider()
 
-            # iCargo comparison (MAWB only)
-            st.markdown("**📊 Compare with iCargo (MAWB)**")
+            # iCargo comparison (MAWB + HAWBs)
+            st.markdown("**📊 Compare with iCargo (MAWB + HAWBs)**")
             if st.button("Fetch & Compare iCargo", key=f"icargo_{idx}", type="primary"):
                 if awb_num and "-" in awb_num:
                     try:
-                        with st.spinner(f"Fetching {awb_num} from iCargo..."):
-                            ic = ICargoIBSClient()
+                        ic = ICargoIBSClient()
+
+                        # ── MAWB comparison ──────────────────────────────────
+                        with st.spinner(f"Fetching MAWB {awb_num} from iCargo..."):
                             icargo_result = ic.get_awb(awb_num)
-                            icargo_flat = map_icargo_awb_ibs(icargo_result)
-                            rows = diff_awb(display_mawb, icargo_flat)
-                            st.dataframe(rows, use_container_width=True)
-                            mismatches = [r for r in rows if not r["match"]]
-                            if not mismatches:
-                                st.success("✅ No differences found!")
-                            else:
-                                st.warning(f"⚠️ {len(mismatches)} difference(s)")
+                        icargo_flat = map_icargo_awb_ibs(icargo_result)
+                        rows = diff_awb(display_mawb, icargo_flat)
+                        st.markdown("##### MAWB")
+                        st.dataframe(rows, use_container_width=True)
+                        mawb_mismatches = [r for r in rows if not r["match"]]
+                        if not mawb_mismatches:
+                            st.success("✅ MAWB — no differences!")
+                        else:
+                            st.warning(f"⚠️ MAWB — {len(mawb_mismatches)} difference(s)")
+
+                        # ── HAWB comparison ──────────────────────────────────
+                        if display_hawbs:
+                            st.markdown("##### HAWBs")
+                            hawbs_resp = None
+                            with st.spinner(f"Fetching HAWBs for {awb_num} from iCargo..."):
+                                try:
+                                    hawbs_resp = ic.get_hawbs(awb_num)
+                                except Exception as he:
+                                    st.warning(f"⚠️ Could not fetch HAWBs from iCargo: {he}")
+
+                            if hawbs_resp is not None:
+                                # ── Normalise response to a flat list ─────────────────
+                                def _flatten_hawbs_resp(resp) -> list:
+                                    if isinstance(resp, list):
+                                        return resp
+                                    if not isinstance(resp, dict):
+                                        return []
+                                    # Try common top-level keys
+                                    for key in ("hawbs", "body", "data", "items", "result", "results"):
+                                        val = resp.get(key)
+                                        if isinstance(val, list) and val:
+                                            return val
+                                        if isinstance(val, dict):
+                                            # one more level: e.g. {"body": {"hawbs": [...]}}
+                                            inner = _flatten_hawbs_resp(val)
+                                            if inner:
+                                                return inner
+                                    return []
+
+                                ic_hawb_list = _flatten_hawbs_resp(hawbs_resp)
+
+                                # ── Raw iCargo debug info ──────────────────────────────
+                                with st.expander(
+                                    f"🔎 iCargo response — {len(ic_hawb_list)} HAWB(s) ricevuti",
+                                    expanded=False,
+                                ):
+                                    st.json(hawbs_resp)
+
+                                def _ic_num(h: dict) -> str:
+                                    return str(
+                                        h.get("hawb")
+                                        or h.get("hawb_number")
+                                        or h.get("hawbNumber")
+                                        or h.get("houseAirwaybillNumber")
+                                        or h.get("hawbNo")
+                                        or ""
+                                    ).strip()
+
+                                def _norm_hawb_key(n: str) -> str:
+                                    return re.sub(r"[\s\-]", "", n).lstrip("0").upper()
+
+                                # Build lookup: normalised_key → (original_num, iCargo record)
+                                ic_by_norm: dict[str, tuple[str, dict]] = {}
+                                for h in ic_hawb_list:
+                                    if isinstance(h, dict):
+                                        raw = _ic_num(h)
+                                        if raw:
+                                            ic_by_norm[_norm_hawb_key(raw)] = (raw, h)
+
+                                # If number-based matching finds ZERO matches, fall back
+                                # to positional so the user always sees something.
+                                pdf_norms = [
+                                    _norm_hawb_key(hawb.get("hawb_number") or f"HAWB_{hi+1}")
+                                    for hi, hawb in enumerate(display_hawbs)
+                                ]
+                                matched_count = sum(1 for k in pdf_norms if k in ic_by_norm)
+                                use_positional = (matched_count == 0 and len(ic_hawb_list) > 0)
+                                if use_positional:
+                                    st.warning(
+                                        "⚠️ Nessun numero HAWB corrisponde tra PDF e iCargo. "
+                                        "Confronto posizionale (1°↔1°, 2°↔2°…). "
+                                        "Verifica i numeri nel pannello debug qui sopra."
+                                    )
+
+                                pdf_nums_seen: set[str] = set()  # tracks normalised keys
+
+                                # ── PDF HAWBs: matched or PDF-only orphan ──────────────
+                                for hi, hawb in enumerate(display_hawbs):
+                                    hawb_num_key = hawb.get("hawb_number") or f"HAWB_{hi + 1}"
+                                    norm_key = _norm_hawb_key(hawb_num_key)
+                                    pdf_nums_seen.add(norm_key)
+
+                                    if use_positional:
+                                        ic_hawb = ic_hawb_list[hi] if hi < len(ic_hawb_list) else None
+                                        ic_label = _ic_num(ic_hawb) if ic_hawb else "—"
+                                    else:
+                                        ic_entry = ic_by_norm.get(norm_key)
+                                        ic_hawb = ic_entry[1] if ic_entry else None
+                                        ic_label = ic_entry[0] if ic_entry else None
+
+                                    if ic_hawb is not None:
+                                        label_suffix = (
+                                            f" ↔ iCargo {ic_label}" if ic_label and ic_label != hawb_num_key else ""
+                                        )
+                                        ic_hawb_flat = map_icargo_hawb_ibs(ic_hawb)
+                                        hawb_rows = diff_hawb(hawb, ic_hawb_flat)
+                                        st.markdown(f"###### {hawb_num_key}{label_suffix}")
+                                        st.dataframe(hawb_rows, use_container_width=True)
+                                        hawb_mismatches = [r for r in hawb_rows if not r["match"]]
+                                        if not hawb_mismatches:
+                                            st.success(f"✅ {hawb_num_key} — no differences!")
+                                        else:
+                                            st.warning(f"⚠️ {hawb_num_key} — {len(hawb_mismatches)} difference(s)")
+                                    else:
+                                        # Orphan: in PDF, not found in iCargo
+                                        st.markdown(f"###### 🔍 {hawb_num_key} — solo PDF")
+                                        ic_hawb_flat = map_icargo_hawb_ibs({})
+                                        hawb_rows = diff_hawb(hawb, ic_hawb_flat)
+                                        st.dataframe(hawb_rows, use_container_width=True)
+
+                                # ── iCargo HAWBs not matched to any PDF HAWB ──────────
+                                if not use_positional:
+                                    for norm_k, (ic_num, ic_hawb) in ic_by_norm.items():
+                                        if norm_k not in pdf_nums_seen:
+                                            st.markdown(f"###### 🔍 {ic_num} — solo iCargo")
+                                            ic_hawb_flat = map_icargo_hawb_ibs(ic_hawb)
+                                            hawb_rows = diff_hawb({}, ic_hawb_flat)
+                                            st.dataframe(hawb_rows, use_container_width=True)
+
                     except Exception as e:
                         st.error(f"iCargo error: {e}")
                 else:

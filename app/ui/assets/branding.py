@@ -262,22 +262,51 @@ h1, h2, h3, h4, h5, h6, p, li, label, span {{
 
 .stTabs [data-baseweb="tab-list"] {{
     gap: 0.5rem;
+    background: transparent !important;
 }}
 
-.stTabs [data-baseweb="tab"] {{
+.stTabs [data-baseweb="tab"],
+.stTabs [role="tab"] {{
     height: 44px;
-    background: rgba(255,255,255,0.68);
-    border: 1px solid var(--msc-line);
+    background: rgba(255,255,255,0.68) !important;
+    border: 1px solid var(--msc-line) !important;
     border-radius: 999px !important;
-    color: var(--msc-slate);
+    color: var(--msc-slate) !important;
     padding: 0 1rem;
 }}
 
-.stTabs [aria-selected="true"],
-.stTabs [aria-selected="true"] * {{
+.stTabs [data-baseweb="tab"] p,
+.stTabs [data-baseweb="tab"] span,
+.stTabs [data-baseweb="tab"] div,
+.stTabs [role="tab"] p,
+.stTabs [role="tab"] span,
+.stTabs [role="tab"] div {{
+    color: var(--msc-slate) !important;
+}}
+
+.stTabs [data-baseweb="tab"][aria-selected="true"],
+.stTabs [role="tab"][aria-selected="true"] {{
     background: var(--msc-black) !important;
     color: var(--msc-white) !important;
     border-color: var(--msc-black) !important;
+}}
+
+.stTabs [data-baseweb="tab"][aria-selected="true"] p,
+.stTabs [data-baseweb="tab"][aria-selected="true"] span,
+.stTabs [data-baseweb="tab"][aria-selected="true"] div,
+.stTabs [role="tab"][aria-selected="true"] p,
+.stTabs [role="tab"][aria-selected="true"] span,
+.stTabs [role="tab"][aria-selected="true"] div {{
+    color: var(--msc-white) !important;
+}}
+
+.stTabs [data-baseweb="tab-highlight"] {{
+    display: none !important;
+}}
+
+.stTabs [data-baseweb="tab-panel"],
+.stTabs [role="tabpanel"] {{
+    background: transparent !important;
 }}
 
 .msc-shell {{

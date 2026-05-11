@@ -230,3 +230,109 @@ def diff_awb(extracted_flat: Dict[str, Any], icargo_flat: Dict[str, Any]) -> Lis
         })
 
     return rows
+
+
+# -----------------------------
+# Mapping: iCargo IBS HAWB JSON (GET /enterprise/v2/awbs/{mawb}/hawbs)
+# -----------------------------
+def map_icargo_hawb_ibs(icargo_hawb: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+
+    def pick(*keys: str) -> Any:
+        return _pick(icargo_hawb, *keys)
+
+    out["hawb_number"] = _norm_str(pick("hawb", "hawb_number", "hawbNumber", "houseAirwaybillNumber"))
+    out["origin"] = _norm_airport(pick("origin", "originAirport", "origin_airport"))
+    out["destination"] = _norm_airport(pick("destination", "destinationAirport", "destination_airport"))
+
+    out["pieces"] = _int_from_any(pick("stated_pieces", "statedPieces", "pieces", "pieceCount"))
+    out["weight"] = _num_from_any(pick("stated_weight", "statedWeight", "weight", "grossWeight"))
+    out["chargeable_weight"] = _num_from_any(pick("chargeable_weight", "chargeableWeight", "chargeableWt"))
+    out["volume"] = _num_from_any(pick("volume", "volumetricWeight", "volumeWeight"))
+    out["total_charge"] = _num_from_any(pick("total_charge", "totalCharge", "total", "totalCharges"))
+
+    out["goods_description"] = _norm_str(
+        pick("shipment_description", "shipmentDescription", "goods_description", "goodsDescription")
+    )
+
+    out["shipper"] = _norm_str(
+        _get_nested(icargo_hawb, "shipper.name")
+        or _get_nested(icargo_hawb, "shipper.shipperName")
+        or pick("shipper_name", "shipperName")
+    )
+    out["consignee"] = _norm_str(
+        _get_nested(icargo_hawb, "consignee.name")
+        or _get_nested(icargo_hawb, "consignee.consigneeName")
+        or pick("consignee_name", "consigneeName")
+    )
+    out["notify_party"] = _norm_str(
+        _get_nested(icargo_hawb, "notify_party.name")
+        or _get_nested(icargo_hawb, "notifyParty.name")
+        or pick("notify_party", "notifyParty")
+    )
+
+    # flight: may be in requested_flight/requestedFlight[0]
+    rf = icargo_hawb.get("requested_flight") or icargo_hawb.get("requestedFlight") or []
+    if isinstance(rf, list) and rf and isinstance(rf[0], dict):
+        carrier = _norm_str(rf[0].get("carrier_code") or rf[0].get("carrierCode")) or ""
+        fnum = _norm_str(rf[0].get("flight_number") or rf[0].get("flightNumber")) or ""
+        out["flight_number"] = f"{carrier}{fnum}" if (carrier or fnum) else None
+        out["flight_date"] = _norm_str(rf[0].get("flight_date") or rf[0].get("flightDate"))
+    else:
+        out["flight_number"] = _norm_str(pick("flight_number", "flightNumber", "flightNo", "flight_no"))
+        out["flight_date"] = _norm_str(pick("flight_date", "flightDate"))
+
+    out["hs_code"] = _norm_str(pick("hs_code", "hsCode", "commodityCode", "harmonizedCode"))
+    out["special_handling"] = _norm_str(pick("special_handling", "specialHandling", "specialHandlingCode"))
+    out["declared_value_carriage"] = _norm_str(pick(
+        "declared_value_carriage", "declaredValueCarriage", "dvcAmount", "declaredValue"
+    ))
+    out["declared_value_customs"] = _norm_str(pick(
+        "declared_value_customs", "declaredValueCustoms", "dvcCustomsAmount"
+    ))
+
+    return out
+
+
+def diff_hawb(extracted_hawb: Dict[str, Any], icargo_flat: Dict[str, Any]) -> List[Dict[str, Any]]:
+    fields = [
+        "hawb_number",
+        "origin",
+        "destination",
+        "shipper",
+        "consignee",
+        "notify_party",
+        "pieces",
+        "weight",
+        "chargeable_weight",
+        "volume",
+        "total_charge",
+        "goods_description",
+        "flight_number",
+        "flight_date",
+        "hs_code",
+        "special_handling",
+        "declared_value_carriage",
+        "declared_value_customs",
+    ]
+
+    rows: List[Dict[str, Any]] = []
+    for f in fields:
+        a = extracted_hawb.get(f)
+        b = icargo_flat.get(f)
+        if f in ("weight", "chargeable_weight", "volume", "total_charge"):
+            match = _float_equal(
+                _num_from_any(a) if not isinstance(a, float) else a,
+                b,
+                tol=0.01,
+            )
+        else:
+            match = (a == b)
+        rows.append({
+            "field": f,
+            "pdf_llm": str(a) if a is not None else None,
+            "icargo": str(b) if b is not None else None,
+            "match": match,
+        })
+
+    return rows

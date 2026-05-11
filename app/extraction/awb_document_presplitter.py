@@ -734,6 +734,42 @@ class AwbDocumentPreSplitter:
             return page_num, ""
 
     @staticmethod
+    def _text_dir_rotation(fitz_page) -> int:
+        """
+        Return the CCW correction angle (0/90/180/270) by reading the dominant
+        text-direction vector embedded in the PDF page structure.
+
+        Works ONLY for digitally-generated (non-scanned) PDFs where characters
+        have actual direction metadata.  Returns 0 for scanned pages (no spans).
+
+        PDF text direction vectors:
+          (1,  0) → upright (normal)           → correction = 0
+          (-1, 0) → 180° rotated               → correction = 180
+          (0, -1) → 90° CCW rotated            → correction = 90
+          (0,  1) → 270° CCW (=90° CW) rotated → correction = 270
+        """
+        _DIR_TO_CCW = {(1, 0): 0, (-1, 0): 180, (0, -1): 90, (0, 1): 270}
+        try:
+            from collections import Counter as _Counter
+            dirs = []
+            # Use rawdict + line-level dir: rawdict gives coordinates in the raw
+            # page coordinate system (before /Rotate normalisation), and line-level
+            # dir is more reliable than span-level in rawdict mode.
+            for block in fitz_page.get_text("rawdict").get("blocks", []):
+                for line in block.get("lines", []):
+                    if line.get("spans"):  # only count lines that have text
+                        d = line.get("dir", (1, 0))
+                        dirs.append((round(d[0]), round(d[1])))
+            if not dirs:
+                return 0  # scanned page — no embedded direction
+            most_common, count = _Counter(dirs).most_common(1)[0]
+            if count < len(dirs) * 0.6:  # no dominant direction
+                return 0
+            return _DIR_TO_CCW.get(most_common, 0)
+        except Exception:
+            return 0
+
+    @staticmethod
     def _detect_rotation_page(page_num: int, img_arr) -> tuple[int, int]:
         """
         Detect page orientation and return (page_num, ccw_degrees_to_correct).
@@ -787,7 +823,13 @@ class AwbDocumentPreSplitter:
                 ).lower()
                 return sum(1 for kw in _AWB_KEYWORDS if kw in txt)
 
-            _CORRECTION = {0: 0, 1: 90, 2: 180, 3: 270}
+            # Coordinate system mapping: numpy rot90 uses screen coords (y-down),
+            # fitz.Matrix.prerotate() uses PDF user-space coords (y-up).
+            # In screen terms:
+            #   np.rot90(k=1) = 90° CCW screen = fitz.prerotate(270)
+            #   np.rot90(k=2) = 180°           = fitz.prerotate(180)
+            #   np.rot90(k=3) = 90° CW  screen = fitz.prerotate(90)
+            _CORRECTION = {0: 0, 1: 270, 2: 180, 3: 90}
             scores: dict[int, int] = {}
             for k in (0, 1, 2, 3):
                 scores[k] = _kw_score_kw(_np.rot90(img_arr, k=k) if k else img_arr)
@@ -798,7 +840,11 @@ class AwbDocumentPreSplitter:
             )
 
             best_k = max(scores, key=lambda k: scores[k])
-            if best_k != 0 and scores[best_k] > scores[0]:
+            # Require at least 2 keyword matches before trusting a non-upright winner.
+            # A single match (score=1) is too likely to be OCR noise on a low-quality
+            # scan (e.g. HAWB-only AMS Manifest where most text is in a scanned image).
+            _MIN_PROBE_SCORE = 2
+            if best_k != 0 and scores[best_k] > scores[0] and scores[best_k] >= _MIN_PROBE_SCORE:
                 correction = _CORRECTION[best_k]
                 _log.debug(
                     "Page %d → %d° CCW (probe k=%d score=%d beats upright=%d)",
@@ -806,10 +852,26 @@ class AwbDocumentPreSplitter:
                 )
                 return page_num, correction
 
-            # All scores equal 0 OR upright wins → fall through to OSD
-            if scores[best_k] > 0:
+            # If 0° wins BUT 180° ties or comes within 1 keyword of 0°, the
+            # document likely has embedded/selectable text that LSTM reads equally
+            # well upside-down (common in carrier-generated PDFs like AMS Manifests).
+            # In this case the keyword probe cannot distinguish 0° from 180°, so
+            # fall through to OSD which looks at glyph geometry instead of content.
+            is_ambiguous_180 = (scores[2] >= scores[0] - 1) and scores[0] > 0
+
+            if scores[best_k] > 0 and not is_ambiguous_180:
                 _log.debug("Page %d: upright wins (score=%d), no rotation", page_num, scores[0])
                 return page_num, 0
+
+            # Sparse page: all keyword scores are 0 → no AWB content found.
+            # OSD on sparse/single-row pages is unreliable (fooled by margin text,
+            # logos, or vertical separators). Return 0 so the vision provider's
+            # gradient analysis (with carry-forward from the previous page) handles it.
+            if scores[best_k] == 0:
+                _log.debug("Page %d: all keyword scores 0 (sparse page) → skip OSD, defer to gradient", page_num)
+                return page_num, 0
+
+            # else: tie with 180° → fall through to OSD to disambiguate
 
         except Exception as _probe_exc:
             _log.debug("Page %d keyword probe failed: %s", page_num, _probe_exc)
@@ -904,9 +966,27 @@ class AwbDocumentPreSplitter:
                     page_texts[page_num] = ""  # placeholder
                     pages_needing_ocr.append(page_num)
 
+        # ── Step 1b: detect rotation for embedded-text pages ──────────────
+        # PyMuPDF get_pixmap() ALREADY applies the page's /Rotate, so we must NOT
+        # add it again.  What we DO need to fix: pages where the content stream CTM
+        # was applied upside-down (e.g. DSV AMS Manifest) — these have /Rotate=0
+        # but the text direction vectors in rawdict reveal the inversion.
+        page_rotations: Dict[int, int] = {}
+        _fitz_doc_dir = _fitz.open(stream=raw_pdf, filetype="pdf")
+        try:
+            for i in range(len(_fitz_doc_dir)):
+                pn = i + 1
+                rot = self._text_dir_rotation(_fitz_doc_dir[i])
+                if rot != 0:
+                    page_rotations[pn] = rot
+                    _log.debug("Page %d: text-direction → %d° CCW correction", pn, rot)
+        finally:
+            _fitz_doc_dir.close()
+
         # ── Step 2: render all scanned pages to numpy IN MAIN THREAD ───────
         # PyMuPDF (fitz) is NOT thread-safe — never pass fitz objects to workers.
         # We render here and pass only plain numpy arrays to the thread pool.
+        # Pages whose rotation was already resolved by text-direction skip OSD.
         page_images: Dict[int, "np.ndarray"] = {}
         if pages_needing_ocr:
             fitz_doc = _fitz.open(stream=raw_pdf, filetype="pdf")
@@ -925,16 +1005,16 @@ class AwbDocumentPreSplitter:
         # Two tasks are submitted per scanned page (both run concurrently):
         #   a) OCR  — top-20% crop, PSM 6  → text used for boundary detection
         #   b) OSD  — full image,  PSM 0   → per-page CCW rotation correction angle
-        # The results are collected separately: OCR fills page_texts,
-        # OSD fills page_rotations (only non-zero entries are stored).
-        page_rotations: Dict[int, int] = {}
+        # Pages whose rotation was already resolved by text-direction skip OSD.
         if page_images:
             ocr_futures: dict = {}
             osd_futures: dict = {}
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 for page_num, img_arr in page_images.items():
                     ocr_futures[pool.submit(self._fast_ocr_page, page_num, img_arr, 0.20)] = page_num
-                    osd_futures[pool.submit(self._detect_rotation_page, page_num, img_arr)] = page_num
+                    # Skip OSD for pages already resolved by PDF text-direction
+                    if page_num not in page_rotations:
+                        osd_futures[pool.submit(self._detect_rotation_page, page_num, img_arr)] = page_num
                 for future in as_completed(ocr_futures):
                     pn, text = future.result()
                     page_texts[pn] = text
@@ -996,11 +1076,21 @@ class AwbDocumentPreSplitter:
             # Per-page rotation corrections (only scanned pages with non-zero rotation).
             # Key: 1-based page number. Value: CCW degrees to rotate to make content upright.
             # Pages not present in the dict require no rotation.
-            doc["page_rotations"] = {
-                p: page_rotations[p]
-                for p in range(doc["start_page"], doc["end_page"] + 1)
-                if p in page_rotations
-            }
+            #
+            # Carry-forward within the document: if a sparse page failed rawdict/OSD
+            # detection (e.g. a nearly-blank final AMS Manifest page) but the previous
+            # page(s) in the same document have a known rotation, propagate that value.
+            # Carry-forward is scoped to the document boundary so it cannot bleed into
+            # the next MAWB block (which may legitimately be portrait/different rotation).
+            doc_rotations: Dict[int, int] = {}
+            _last_rot = 0
+            for p in range(doc["start_page"], doc["end_page"] + 1):
+                if p in page_rotations:
+                    _last_rot = page_rotations[p]
+                    doc_rotations[p] = _last_rot
+                elif _last_rot != 0:
+                    doc_rotations[p] = _last_rot  # inherit from previous page in doc
+            doc["page_rotations"] = doc_rotations
 
         return documents
 
