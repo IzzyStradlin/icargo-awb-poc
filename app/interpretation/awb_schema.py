@@ -11,16 +11,24 @@ class AwbData(BaseModel):
     consignee_address: Optional[str] = None  # Full address of consignee
     agent: Optional[str] = None  # Client/customer (often same as shipper)
     agent_address: Optional[str] = None  # Full address of issuing agent
+    notify_party: Optional[str] = None
     origin: Optional[str] = None
     destination: Optional[str] = None
     pieces: Optional[int] = None
     weight: Optional[float] = None  # Gross weight in kg
-    chargeable_weight: Optional[float] = None  # Chargeable weight in kg (for billing)
+    chargeable_weight: Optional[float] = None  # Chargeable weight in kg
+    volume: Optional[float] = None  # Volume in CBM / m³
+    dimensions: Optional[str] = None  # Package dimensions free text
     rate: Optional[float] = None          # Rate/Charge per kg
-    total_charge: Optional[float] = None  # Total charges = chargeable_weight * rate
+    total_charge: Optional[float] = None  # Total charges
+    currency: Optional[str] = None
     goods_description: Optional[str] = None
+    hs_code: Optional[str] = None
+    special_handling: Optional[str] = None
+    declared_value_carriage: Optional[str] = None
+    declared_value_customs: Optional[str] = None
     flight_no: Optional[str] = None
-    flight_date: Optional[str] = None  # ISO date in PoC
+    flight_date: Optional[str] = None  # ISO date
 
     @property
     def awb_number(self) -> Optional[str]:

@@ -33,6 +33,24 @@ CRITICAL: "agent" must come from the "Issuing Carrier's Agent Name and City" box
 The routing / To-By table row format is: DESTINATION (3 letters) | CARRIER (2 letters) | FLIGHT/DATE
 Example: "HKG | CP | 113/19"  →  flight_number = "CP113", destination = "HKG"
 
+== FLIGHT NUMBER / DATE PARSING ==
+The routing row often encodes the flight number and day-of-month together using a separator.
+  Known separators: dot (.), slash (/), underscore (_), or a space.
+  Formats: "FLIGHTCODE.DAY", "FLIGHTCODE/DAY", "FLIGHTCODE_DAY", "FLIGHTCODE DAY"
+  Examples: "CP139.7", "CP139.07", "CP137/19", "CP137_19", "CP137 19", "LH2054/03"
+Parsing rules:
+  - Everything BEFORE the separator is the flight number (2-letter code + digits, e.g. "CP137", "LH2054").
+  - The number AFTER the separator is the DAY of the month (1 or 2 digits, e.g. 7, 07, 19).
+  - The MONTH and YEAR must be read from another date printed elsewhere on the same document
+    (e.g. execution/issue date, date stamp in the header or footer area, or a printed month/year).
+  - Reconstruct the full flight_date in YYYY-MM-DD by combining: day (from separator) + month + year (from reference date).
+  - Examples:
+      "CP137/19"  + document shows "MAY 2026" → flight_number = "CP137",  flight_date = "2026-05-19"
+      "CP139.7"   + document shows "MAY 2026" → flight_number = "CP139",  flight_date = "2026-05-07"
+      "LH2054 03" + document shows "MAY 2026" → flight_number = "LH2054", flight_date = "2026-05-03"
+  - If no reference date is found anywhere in the document, set flight_date to null.
+  - NEVER include the separator and day in flight_number (output "CP137", not "CP137/19" or "CP137 19").
+
 == FIELDS (use exactly these JSON keys, set null if not found) ==
 awb_number        — format NNN-NNNNNNNN (e.g. 233-10166763)
 origin            — IATA 3-letter airport code from the "Airport of Departure" field (top-left area, below the AWB number). Convert the city/airport name to its IATA code (e.g. "MALPENSA APT/MILANO" → "MXP", "HONG KONG" → "HKG").
@@ -55,14 +73,22 @@ agent_city        — city of agent
 agent_province    — province/state of agent
 agent_zip         — postal code of agent
 agent_country     — 2-letter ISO country code of agent
+notify_party      — notify party name and address (free text, null if absent)
 pieces            — integer from "No. Of Pieces RCP" column (small number 1-999, NOT the charge total)
 weight            — gross weight in kg (numeric, no units)
 chargeable_weight — chargeable weight in kg from the "Chargeable Weight" column (may differ from gross weight)
+volume            — volume in CBM / m³ (numeric, null if not stated)
+dimensions        — package dimensions as free text (e.g. "60x40x30 cm"), null if not stated
 rate              — rate per kg from "Rate/Charge" column (numeric)
 total_charge      — total charge from "Total" column (numeric)
-flight_number     — 2-letter airline code + numeric flight (e.g. CP113, LH2054) from the To/By routing row
-flight_date       — date from flight/date field in YYYY-MM-DD format
+flight_number     — 2-letter airline code + numeric flight (e.g. CP113, LH2054) from the To/By routing row; strip the dot and day suffix if present
+flight_date       — flight date reconstructed in YYYY-MM-DD (see FLIGHT NUMBER / DATE PARSING above)
 goods_description — full verbatim text from "Nature and Quantity of Goods" column
+hs_code           — HS / Harmonized System commodity code, null if not stated
+special_handling  — special handling codes (e.g. "PER", "AVI", "DGR"), null if absent
+declared_value_carriage — declared value for carriage, null if not stated
+declared_value_customs  — declared value for customs, null if not stated
+currency          — currency code (e.g. "EUR", "USD"), null if not stated
 
 Return ONLY the JSON object.\
 """
@@ -93,6 +119,25 @@ The RIGHT column contains "Not Negotiable Air Waybill — Issued by [Carrier nam
 CRITICAL: the `agent` field must be read from the "Issuing Carrier's Agent Name and City" box (left side), NOT from the "Issued by" box (right side).
 Always read the printed box label on the form to identify each field.
 
+== FLIGHT NUMBER / DATE PARSING ==
+The routing row often encodes the flight number and day-of-month together using a separator.
+  Known separators: dot (.), slash (/), underscore (_), or a space.
+  Formats: "FLIGHTCODE.DAY", "FLIGHTCODE/DAY", "FLIGHTCODE_DAY", "FLIGHTCODE DAY"
+  Examples: "CP139.7", "CP139.07", "CP137/19", "CP137_19", "CP137 19", "LH2054/03"
+Parsing rules:
+  - Everything BEFORE the separator is the flight number (2-letter code + digits, e.g. "CP137", "LH2054").
+  - The number AFTER the separator is the DAY of the month (1 or 2 digits, e.g. 7, 07, 19).
+  - The MONTH and YEAR must be read from another date printed elsewhere on the same document
+    (e.g. execution/issue date, date stamp in the header or footer area, or a printed month/year).
+  - Reconstruct the full flight_date in YYYY-MM-DD by combining: day (from separator) + month + year (from reference date).
+  - Examples:
+      "CP137/19"  + document shows "MAY 2026" → flight_number = "CP137",  flight_date = "2026-05-19"
+      "CP139.7"   + document shows "MAY 2026" → flight_number = "CP139",  flight_date = "2026-05-07"
+      "LH2054 03" + document shows "MAY 2026" → flight_number = "LH2054", flight_date = "2026-05-03"
+  - If no reference date is found anywhere in the document, set flight_date to null.
+  - NEVER include the separator and day in flight_number (output "CP137", not "CP137/19" or "CP137 19").
+This rule applies to BOTH the mawb and hawb flight fields.
+
 == MAWB FIELDS (under "mawb" key) ==
 awb_number        — MAWB number, format NNN-NNNNNNNN (e.g. 233-10166763)
 origin            — IATA 3-letter code from the "Airport of Departure" field (below the AWB number). Convert airport/city name to IATA code (e.g. "MALPENSA APT/MILANO" → "MXP").
@@ -103,14 +148,22 @@ consignee         — consignee company name
 consignee_street / consignee_city / consignee_province / consignee_zip / consignee_country
 agent             — company name from "Issuing Carrier's Agent Name and City" box (LEFT side, below consignee — freight forwarder, NOT the airline in the "Issued by" box)
 agent_street / agent_city / agent_province / agent_zip / agent_country
+notify_party      — notify party name and address (free text, null if absent)
 pieces            — total number of pieces (integer)
 weight            — total gross weight in kg (numeric)
 chargeable_weight — total chargeable weight in kg (numeric)
+volume            — volume in CBM / m³ (numeric, null if not stated)
+dimensions        — package dimensions as free text, null if not stated
 rate              — rate per kg (numeric)
 total_charge      — total charge (numeric)
-flight_number     — 2-letter airline code + flight number (e.g. CP113)
-flight_date       — flight date in YYYY-MM-DD
+flight_number     — 2-letter airline code + flight number (e.g. CP113); strip dot and day suffix if present
+flight_date       — flight date reconstructed in YYYY-MM-DD (see FLIGHT NUMBER / DATE PARSING above)
 goods_description — full description of goods
+hs_code           — HS / Harmonized System commodity code, null if not stated
+special_handling  — special handling codes (e.g. "PER", "AVI", "DGR"), null if absent
+declared_value_carriage — declared value for carriage, null if not stated
+declared_value_customs  — declared value for customs, null if not stated
+currency          — currency code (e.g. "EUR", "USD"), null if not stated
 
 == HAWB FIELDS (each element in "hawbs" array) ==
 IMPORTANT — TWO HAWB DOCUMENT FORMATS exist:

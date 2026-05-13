@@ -106,7 +106,7 @@ def render_landing():
             """,
             unsafe_allow_html=True,
         )
-        if st.button("Open PDF Workflow", key="btn_pdf", use_container_width=True):
+        if st.button("Open PDF Workflow", key="btn_pdf", width='stretch'):
             set_page("pdf_upload")
 
     with col2:
@@ -120,7 +120,7 @@ def render_landing():
             """,
             unsafe_allow_html=True,
         )
-        if st.button("Open Email Workflow", key="btn_email", use_container_width=True):
+        if st.button("Open Email Workflow", key="btn_email", width='stretch'):
             set_page("email_upload")
 
     with col3:
@@ -134,7 +134,7 @@ def render_landing():
             """,
             unsafe_allow_html=True,
         )
-        if st.button("Open AWB Lookup", key="btn_lookup", use_container_width=True):
+        if st.button("Open AWB Lookup", key="btn_lookup", width='stretch'):
             set_page("awb_lookup")
 
     st.markdown(

@@ -121,6 +121,13 @@ def _awb_form(awb_num: str, data: dict):
             st.write(f"🛫 Flight: **{_val(data.get('flight_number'))}**")
             st.write(f"📅 Date: **{_val(data.get('flight_date'))}**")
 
+    # Notify party (if present)
+    notify = data.get("notify_party")
+    if notify and notify not in ("null", ""):
+        with st.container(border=True):
+            st.markdown("**Notify Party**")
+            st.text(notify)
+
     # Cargo figures
     c5, c6, c7, c8 = st.columns(4)
     with c5:
@@ -140,6 +147,22 @@ def _awb_form(awb_num: str, data: dict):
             st.markdown("**Rate / Total**")
             st.write(f"Rate: **{_val(data.get('rate'))}**")
             st.write(f"Total: **{_val(data.get('total_charge'))}**")
+            st.write(f"Currency: **{_val(data.get('currency'))}**")
+
+    # Volume / Dimensions / HS / Special handling
+    extras = [
+        ("Volume", _val(data.get("volume"), " m³")),
+        ("Dimensions", _val(data.get("dimensions"))),
+        ("HS Code", _val(data.get("hs_code"))),
+        ("Special Handling", _val(data.get("special_handling"))),
+        ("Decl. Value Carriage", _val(data.get("declared_value_carriage"))),
+        ("Decl. Value Customs", _val(data.get("declared_value_customs"))),
+    ]
+    filled = [(lbl, v) for lbl, v in extras if v != "—"]
+    if filled:
+        ecols = st.columns(len(filled))
+        for col, (lbl, v) in zip(ecols, filled):
+            col.metric(lbl, v)
 
     # Goods description
     with st.container(border=True):
@@ -538,10 +561,10 @@ def render_pdf_upload(on_back):
         extract_btn = st.button(
             f"🚀 Extract all ({len(split_docs)}) with Claude Vision",
             type="primary",
-            use_container_width=True,
+            width='stretch',
         )
     with col_reset:
-        if st.button("🗑 Reset", type="secondary", use_container_width=True):
+        if st.button("🗑 Reset", type="secondary", width='stretch'):
             st.session_state["awb_results"] = None
             st.session_state["vision_refined_awbs"] = {}
             st.rerun()
@@ -671,7 +694,7 @@ def render_pdf_upload(on_back):
                         icargo_flat = map_icargo_awb_ibs(icargo_result)
                         rows = diff_awb(display_mawb, icargo_flat)
                         st.markdown("##### MAWB")
-                        st.dataframe(rows, use_container_width=True)
+                        st.dataframe(rows, width='stretch')
                         mawb_mismatches = [r for r in rows if not r["match"]]
                         if not mawb_mismatches:
                             st.success("✅ MAWB — no differences!")
@@ -737,21 +760,6 @@ def render_pdf_upload(on_back):
                                         if raw:
                                             ic_by_norm[_norm_hawb_key(raw)] = (raw, h)
 
-                                # If number-based matching finds ZERO matches, fall back
-                                # to positional so the user always sees something.
-                                pdf_norms = [
-                                    _norm_hawb_key(hawb.get("hawb_number") or f"HAWB_{hi+1}")
-                                    for hi, hawb in enumerate(display_hawbs)
-                                ]
-                                matched_count = sum(1 for k in pdf_norms if k in ic_by_norm)
-                                use_positional = (matched_count == 0 and len(ic_hawb_list) > 0)
-                                if use_positional:
-                                    st.warning(
-                                        "⚠️ Nessun numero HAWB corrisponde tra PDF e iCargo. "
-                                        "Confronto posizionale (1°↔1°, 2°↔2°…). "
-                                        "Verifica i numeri nel pannello debug qui sopra."
-                                    )
-
                                 pdf_nums_seen: set[str] = set()  # tracks normalised keys
 
                                 # ── PDF HAWBs: matched or PDF-only orphan ──────────────
@@ -760,13 +768,9 @@ def render_pdf_upload(on_back):
                                     norm_key = _norm_hawb_key(hawb_num_key)
                                     pdf_nums_seen.add(norm_key)
 
-                                    if use_positional:
-                                        ic_hawb = ic_hawb_list[hi] if hi < len(ic_hawb_list) else None
-                                        ic_label = _ic_num(ic_hawb) if ic_hawb else "—"
-                                    else:
-                                        ic_entry = ic_by_norm.get(norm_key)
-                                        ic_hawb = ic_entry[1] if ic_entry else None
-                                        ic_label = ic_entry[0] if ic_entry else None
+                                    ic_entry = ic_by_norm.get(norm_key)
+                                    ic_hawb = ic_entry[1] if ic_entry else None
+                                    ic_label = ic_entry[0] if ic_entry else None
 
                                     if ic_hawb is not None:
                                         label_suffix = (
@@ -775,7 +779,7 @@ def render_pdf_upload(on_back):
                                         ic_hawb_flat = map_icargo_hawb_ibs(ic_hawb)
                                         hawb_rows = diff_hawb(hawb, ic_hawb_flat)
                                         st.markdown(f"###### {hawb_num_key}{label_suffix}")
-                                        st.dataframe(hawb_rows, use_container_width=True)
+                                        st.dataframe(hawb_rows, width='stretch')
                                         hawb_mismatches = [r for r in hawb_rows if not r["match"]]
                                         if not hawb_mismatches:
                                             st.success(f"✅ {hawb_num_key} — no differences!")
@@ -786,16 +790,15 @@ def render_pdf_upload(on_back):
                                         st.markdown(f"###### 🔍 {hawb_num_key} — solo PDF")
                                         ic_hawb_flat = map_icargo_hawb_ibs({})
                                         hawb_rows = diff_hawb(hawb, ic_hawb_flat)
-                                        st.dataframe(hawb_rows, use_container_width=True)
+                                        st.dataframe(hawb_rows, width='stretch')
 
                                 # ── iCargo HAWBs not matched to any PDF HAWB ──────────
-                                if not use_positional:
-                                    for norm_k, (ic_num, ic_hawb) in ic_by_norm.items():
-                                        if norm_k not in pdf_nums_seen:
-                                            st.markdown(f"###### 🔍 {ic_num} — solo iCargo")
-                                            ic_hawb_flat = map_icargo_hawb_ibs(ic_hawb)
-                                            hawb_rows = diff_hawb({}, ic_hawb_flat)
-                                            st.dataframe(hawb_rows, use_container_width=True)
+                                for norm_k, (ic_num, ic_hawb) in ic_by_norm.items():
+                                    if norm_k not in pdf_nums_seen:
+                                        st.markdown(f"###### 🔍 {ic_num} — solo iCargo")
+                                        ic_hawb_flat = map_icargo_hawb_ibs(ic_hawb)
+                                        hawb_rows = diff_hawb({}, ic_hawb_flat)
+                                        st.dataframe(hawb_rows, width='stretch')
 
                     except Exception as e:
                         st.error(f"iCargo error: {e}")

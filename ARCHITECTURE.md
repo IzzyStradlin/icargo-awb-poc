@@ -1,7 +1,7 @@
 ﻿# Architecture — iCargo AWB Intelligent Processor (PoC)
 
 > **Status:** Proof of Concept  
-> **Version:** 1.3.0  
+> **Version:** 1.4.0  
 > **Owner:** MSC Air Cargo
 
 ---
@@ -180,13 +180,33 @@ Each MAWB page range is converted to PNG images (via PyMuPDF/fitz) and sent to *
 
 **Key design decisions:**
 - No intermediate OCR text is sent to Claude — images are sent directly, preserving the 2-column IATA AWB layout that regex cannot reliably parse.
-- A structured JSON prompt instructs Claude to return exactly the AWB schema fields (`awb_number`, `shipper`, `consignee`, `origin`, `destination`, `flight_number`, `pieces`, `weight`, …).
+- A structured JSON prompt instructs Claude to return exactly the AWB schema fields.
 - **Orientation correction** — before base64-encoding, `ClaudeVisionProvider._render_pages` applies `fitz.Matrix(1.5, 1.5).prerotate(correction)` per page, where `correction` (CCW degrees) comes from:
 1. `page_rotations[page]` (presplitter keyword-probe result) if present — highest priority.
 2. PDF content-stream text-direction (rawdict `dir` vectors) for digitally-generated PDFs.
 3. Pixel gradient score (row variance / column variance of dark pixels) comparing 0° and 90° — with carry-forward from the previous page when ambiguous.
 
 PyMuPDF automatically applies the page's `/Rotate` entry before rendering, so correction angles are always relative to that already-normalised image.
+
+**Extracted MAWB fields:** `awb_number`, `origin`, `destination`, `shipper` (+ address parts), `consignee` (+ address parts), `agent` (+ address parts), `notify_party`, `pieces`, `weight`, `chargeable_weight`, `volume`, `dimensions`, `rate`, `total_charge`, `currency`, `goods_description`, `hs_code`, `special_handling`, `declared_value_carriage`, `declared_value_customs`, `flight_number`, `flight_date`.
+
+**Extracted HAWB fields:** same as MAWB plus `hawb_number`; AMS Manifest table rows are each extracted as a separate HAWB entry.
+
+**Flight number / date parsing:**
+Cargo AWB routing rows often encode flight and day-of-month together with a separator:
+
+| Notation | Example | Separator |
+|---|---|---|
+| `FLIGHT.DAY` | `CP139.7`, `CP139.07` | dot |
+| `FLIGHT/DAY` | `CP137/19`, `LH2054/03` | slash |
+| `FLIGHT_DAY` | `CP137_19` | underscore |
+| `FLIGHT DAY` | `LH2054 03` | space |
+
+Claude is instructed to:
+1. Split on the first occurrence of `.` `/` `_` or space between the alpha code and a 1-2 digit number.
+2. Use the left part as `flight_number` (e.g. `"CP137"`).
+3. Use the right part as the day-of-month and look for a reference month/year elsewhere in the same document (issue date, footer stamp) to reconstruct `flight_date` in `YYYY-MM-DD`.
+4. Return `null` for `flight_date` if no reference month/year is found.
 
 **Rotation detection cascade (`_detect_rotation_page`):**
 
@@ -280,6 +300,18 @@ Normalisation applied before comparison:
 - **Airport codes:** uppercase 3-letter IATA.
 - **Weights / numeric fields:** parse from various formats (`"150 kg"`, `{"value":150,"unit":"kg"}`, `150.0`).
 - **AWB numbers:** normalise to `NNN-NNNNNNNN` format.
+
+**HAWB matching strategy (UI — `pdf_upload.py`):**
+
+When the user clicks *Fetch & Compare iCargo*, HAWBs from the PDF are matched to iCargo HAWBs **by number** rather than by position:
+
+1. `_ic_num(h)` extracts the HAWB number from the iCargo record, checking `hawb`, `hawb_number`, `hawbNumber`, `houseAirwaybillNumber`, `hawbNo` in priority order.
+2. Both sides are normalised with `_norm_hawb_key`: strip spaces/dashes, remove leading zeros, uppercase.
+3. A dict `ic_by_norm` maps normalised key → iCargo record.
+4. For each PDF HAWB, lookup is done on the normalised key.
+5. **Fallback:** if zero matches are found across all PDF HAWBs (format mismatch), the comparison falls back to positional order with a visible warning.
+6. **Orphans:** PDF HAWBs with no iCargo counterpart are shown as *"solo PDF"*; iCargo HAWBs not matched by any PDF HAWB are shown as *"solo iCargo"*.
+7. An expander shows the raw iCargo JSON response for debugging.
 
 ---
 
@@ -375,6 +407,15 @@ AwbVisionExtractor.extract_mawb_with_hawbs
                 → map_icargo_awb_ibs(icargo_raw)  → flat dict
                 → diff_awb(extracted, icargo_flat) → DiffRow list
                 → Rendered as dataframe in UI
+
+            [optional] ICargoIBSClient.get_hawbs(awb_number)
+                → hawbs_resp JSON  (key "hawb" carries the HAWB number)
+                → _flatten_hawbs_resp()  → ic_hawb_list
+                → match by normalised HAWB number (strip dashes/spaces/leading zeros)
+                    ├── matched     → diff_hawb(pdf_hawb, ic_hawb) → DiffRow list
+                    ├── solo PDF    → diff_hawb(pdf_hawb, {})       → shown as orphan
+                    └── solo iCargo → diff_hawb({}, ic_hawb)        → shown as orphan
+                → fallback positional if zero matches found (with warning)
 
 Batch (ZIP) download:
   results list → JSON  (all MAWBs + HAWBs across all source PDFs)
@@ -523,4 +564,4 @@ The answer determines the batch size and whether a fixed batch of 4–5 per call
 
 ---
 
-*Document updated: May 2026 (v1.3.0 — rotation fix: numpy↔fitz coordinate mapping, presplitter carry-forward, gradient fallback) — MSC Air Cargo / iCargo PoC Team*
+*Document updated: May 2026 (v1.4.0 — HAWB match-by-number + orphan display, expanded MAWB fields, flight notation parsing CP137/19 and variants) — MSC Air Cargo / iCargo PoC Team*

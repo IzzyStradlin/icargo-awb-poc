@@ -770,11 +770,16 @@ class AwbDocumentPreSplitter:
             return 0
 
     @staticmethod
-    def _detect_rotation_page(page_num: int, img_arr) -> tuple[int, int]:
+    def _detect_rotation_page(page_num: int, img_arr) -> tuple[int, int, bool]:
         """
-        Detect page orientation and return (page_num, ccw_degrees_to_correct).
+        Detect page orientation and return (page_num, ccw_degrees_to_correct, conclusive).
 
-        Uses the following cascade:
+        `conclusive` is True when the probe produced a positive-score result —
+        including explicitly-confirmed upright (correction=0) — so that the caller
+        can store the result in page_rotations and prevent spurious carry-forward
+        from a preceding rotated page.
+        `conclusive` is False when all keyword scores were 0 (sparse/blank page);
+        in that case carry-forward from the previous page is intentional.
 
           1. Keyword probe (primary) — tries all 4 rotations (0°, 90°, 180°,
              270° CCW) and picks the one where Tesseract finds the most AWB
@@ -794,7 +799,7 @@ class AwbDocumentPreSplitter:
             from PIL import Image as _PILImage
             import numpy as _np
         except ImportError:
-            return page_num, 0
+            return page_num, 0, False
 
         h, w = img_arr.shape[:2]
 
@@ -850,7 +855,7 @@ class AwbDocumentPreSplitter:
                     "Page %d → %d° CCW (probe k=%d score=%d beats upright=%d)",
                     page_num, correction, best_k, scores[best_k], scores[0],
                 )
-                return page_num, correction
+                return page_num, correction, True
 
             # If 0° wins BUT 180° ties or comes within 1 keyword of 0°, the
             # document likely has embedded/selectable text that LSTM reads equally
@@ -861,7 +866,7 @@ class AwbDocumentPreSplitter:
 
             if scores[best_k] > 0 and not is_ambiguous_180:
                 _log.debug("Page %d: upright wins (score=%d), no rotation", page_num, scores[0])
-                return page_num, 0
+                return page_num, 0, True  # conclusive: this page is confirmed portrait
 
             # Sparse page: all keyword scores are 0 → no AWB content found.
             # OSD on sparse/single-row pages is unreliable (fooled by margin text,
@@ -869,13 +874,12 @@ class AwbDocumentPreSplitter:
             # gradient analysis (with carry-forward from the previous page) handles it.
             if scores[best_k] == 0:
                 _log.debug("Page %d: all keyword scores 0 (sparse page) → skip OSD, defer to gradient", page_num)
-                return page_num, 0
+                return page_num, 0, False  # not conclusive: allow carry-forward
 
             # else: tie with 180° → fall through to OSD to disambiguate
 
         except Exception as _probe_exc:
             _log.debug("Page %d keyword probe failed: %s", page_num, _probe_exc)
-
         # ── Strategy 2: OSD — trust only if confident AND non-zero ─────────
         # --oem 0: legacy engine required for --psm 0 (OSD).
         # --oem 1 (LSTM) is silently incompatible with OSD.
@@ -895,7 +899,7 @@ class AwbDocumentPreSplitter:
                 osd_rotate = rotate  # remember the confident result
                 if rotate != 0:
                     # OSD says this page is clearly NOT upright → trust it
-                    return page_num, rotate
+                    return page_num, rotate, True
                 # rotate == 0: OSD says upright, BUT we still run the keyword
                 # probe below because OSD can be fooled by a portrait company
                 # header when the HAWB body is landscape.
@@ -911,18 +915,18 @@ class AwbDocumentPreSplitter:
                 "Page %d: keyword probe inconclusive, OSD fallback → %d°",
                 page_num, osd_rotate,
             )
-            return page_num, osd_rotate
+            return page_num, osd_rotate, True
 
         if osd_rotate == 0:
             _log.debug(
                 "Page %d: keyword probe inconclusive, OSD says 0° → no rotation",
                 page_num,
             )
-            return page_num, 0
+            return page_num, 0, True  # OSD confident about upright
 
         # ── Strategy 3: give up ─────────────────────────────────────────────
         _log.debug("Page %d: no rotation detected (w=%d h=%d)", page_num, w, h)
-        return page_num, 0
+        return page_num, 0, False  # unknown — allow carry-forward
 
     def presplit_pdf_fast(self, raw_pdf: bytes, max_workers: int = 4) -> List[Dict[str, any]]:
         """
@@ -1019,8 +1023,12 @@ class AwbDocumentPreSplitter:
                     pn, text = future.result()
                     page_texts[pn] = text
                 for future in as_completed(osd_futures):
-                    pn, rotation = future.result()
-                    if rotation != 0:
+                    pn, rotation, conclusive = future.result()
+                    # Store if non-zero (always) OR if the probe positively
+                    # confirmed upright orientation (conclusive=True, rotation=0).
+                    # This prevents carry-forward from a preceding rotated page
+                    # overriding a portrait page that was correctly identified as 0°.
+                    if rotation != 0 or conclusive:
                         page_rotations[pn] = rotation
 
         # ── Step 4: run the standard splitting logic on collected texts ─────

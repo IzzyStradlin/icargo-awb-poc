@@ -56,7 +56,7 @@ def render_awb_lookup(on_back):
             label_visibility="collapsed",
         )
     with col_btn:
-        search = st.button("🔍 Retrieve", use_container_width=True)
+        search = st.button("🔍 Retrieve", width='stretch')
 
     if search:
         awb_raw = awb_input.strip()
@@ -106,7 +106,7 @@ def render_awb_lookup(on_back):
                 data=json.dumps(data, indent=2, ensure_ascii=False),
                 file_name=f"awb_{awb_number.replace('-', '')}.json",
                 mime="application/json",
-                use_container_width=True,
+                width='stretch',
                 key="dl_mawb",
             )
         st.json(data, expanded=True)
@@ -151,7 +151,7 @@ def render_awb_lookup(on_back):
                         data=json.dumps(hawbs_resp, indent=2, ensure_ascii=False),
                         file_name=f"hawbs_{awb_number.replace('-', '')}.json",
                         mime="application/json",
-                        use_container_width=True,
+                        width='stretch',
                         key="dl_hawbs",
                     )
                 for i, hawb in enumerate(hawb_list):
