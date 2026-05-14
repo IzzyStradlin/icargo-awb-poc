@@ -70,3 +70,23 @@ class ICargoIBSClient:
             r = client.get(url, headers=self._headers())
             r.raise_for_status()
             return r.json()
+
+    def get_dangerous_goods(self, awb_code: str) -> dict:
+        """Retrieve the Dangerous Goods Declaration for an AWB.
+        Endpoint: GET /v2/awbs/{awb}/dangerous-goods-declaration
+        """
+        url = f"{self.base_url}/icargo-api/m4/enterprise/v2/awbs/{awb_code}/dangerous-goods-declaration"
+        with httpx.Client(timeout=self.timeout) as client:
+            r = client.get(url, headers=self._headers())
+            r.raise_for_status()
+            return r.json()
+
+    def get_security_declaration(self, awb_code: str) -> dict:
+        """Retrieve the Security Declaration for an AWB.
+        Endpoint: GET /v2/awbs/{awb}/securitydeclaration
+        """
+        url = f"{self.base_url}/icargo-api/m4/enterprise/v2/awbs/{awb_code}/securitydeclaration"
+        with httpx.Client(timeout=self.timeout) as client:
+            r = client.get(url, headers=self._headers())
+            r.raise_for_status()
+            return r.json()

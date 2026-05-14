@@ -43,6 +43,10 @@ def render_awb_lookup(on_back):
         "lookup_mawb_data": None,
         "lookup_hawbs_data": None,
         "lookup_hawbs_error": None,
+        "lookup_dgr_data": None,
+        "lookup_dgr_error": None,
+        "lookup_secdecl_data": None,
+        "lookup_secdecl_error": None,
     }.items():
         if key not in st.session_state:
             st.session_state[key] = val
@@ -72,6 +76,10 @@ def render_awb_lookup(on_back):
                 st.session_state["lookup_mawb_data"] = data
                 st.session_state["lookup_hawbs_data"] = None
                 st.session_state["lookup_hawbs_error"] = None
+                st.session_state["lookup_dgr_data"] = None
+                st.session_state["lookup_dgr_error"] = None
+                st.session_state["lookup_secdecl_data"] = None
+                st.session_state["lookup_secdecl_error"] = None
             except Exception as exc:
                 st.error(f"**Error:** {exc}")
                 st.stop()
@@ -93,8 +101,8 @@ def render_awb_lookup(on_back):
 
     st.divider()
 
-    # ── Tabs: MAWB / Linked HAWBs ─────────────────────────────────────────────
-    tab_mawb, tab_hawbs = st.tabs(["📋 MAWB", "🏠 Linked HAWBs"])
+    # ── Tabs: MAWB / Linked HAWBs / DGR / Security ─────────────────────────────
+    tab_mawb, tab_hawbs, tab_dgr, tab_secdecl = st.tabs(["📋 MAWB", "🏠 Linked HAWBs", "☢️ DGR", "🔒 Security"])
 
     with tab_mawb:
         col_view, col_dl = st.columns([5, 1], gap="small")
@@ -166,3 +174,63 @@ def render_awb_lookup(on_back):
             else:
                 st.info("No HAWBs found for this MAWB (empty response).")
                 st.json(hawbs_resp, expanded=True)
+
+    with tab_dgr:
+        st.caption("Calls `GET /v2/awbs/{awb}/dangerous-goods-declaration` to retrieve the DGR declaration.")
+        if st.button("🔍 Fetch DGR Declaration", key="fetch_dgr_btn"):
+            with st.spinner(f"Querying DGR for AWB {awb_number}…"):
+                try:
+                    client = _get_client()
+                    dgr_resp = client.get_dangerous_goods(awb_number)
+                    st.session_state["lookup_dgr_data"] = dgr_resp
+                    st.session_state["lookup_dgr_error"] = None
+                except Exception as exc:
+                    st.session_state["lookup_dgr_data"] = None
+                    st.session_state["lookup_dgr_error"] = str(exc)
+
+        if st.session_state.get("lookup_dgr_error"):
+            st.error(f"**Error:** {st.session_state['lookup_dgr_error']}")
+
+        dgr_resp = st.session_state.get("lookup_dgr_data")
+        if dgr_resp is not None:
+            _, col_dl_dgr = st.columns([5, 1], gap="small")
+            with col_dl_dgr:
+                st.download_button(
+                    label="⬇ Download JSON",
+                    data=json.dumps(dgr_resp, indent=2, ensure_ascii=False),
+                    file_name=f"dgr_{awb_number.replace('-', '')}.json",
+                    mime="application/json",
+                    width='stretch',
+                    key="dl_dgr",
+                )
+            st.json(dgr_resp, expanded=True)
+
+    with tab_secdecl:
+        st.caption("Calls `GET /v2/awbs/{awb}/securitydeclaration` to retrieve the Security Declaration.")
+        if st.button("🔍 Fetch Security Declaration", key="fetch_secdecl_btn"):
+            with st.spinner(f"Querying Security Declaration for AWB {awb_number}…"):
+                try:
+                    client = _get_client()
+                    secdecl_resp = client.get_security_declaration(awb_number)
+                    st.session_state["lookup_secdecl_data"] = secdecl_resp
+                    st.session_state["lookup_secdecl_error"] = None
+                except Exception as exc:
+                    st.session_state["lookup_secdecl_data"] = None
+                    st.session_state["lookup_secdecl_error"] = str(exc)
+
+        if st.session_state.get("lookup_secdecl_error"):
+            st.error(f"**Error:** {st.session_state['lookup_secdecl_error']}")
+
+        secdecl_resp = st.session_state.get("lookup_secdecl_data")
+        if secdecl_resp is not None:
+            _, col_dl_sec = st.columns([5, 1], gap="small")
+            with col_dl_sec:
+                st.download_button(
+                    label="⬇ Download JSON",
+                    data=json.dumps(secdecl_resp, indent=2, ensure_ascii=False),
+                    file_name=f"secdecl_{awb_number.replace('-', '')}.json",
+                    mime="application/json",
+                    width='stretch',
+                    key="dl_secdecl",
+                )
+            st.json(secdecl_resp, expanded=True)
