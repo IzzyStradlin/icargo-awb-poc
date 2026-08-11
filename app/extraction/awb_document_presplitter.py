@@ -420,7 +420,23 @@ class AwbDocumentPreSplitter:
                     "awb_number": None,
                 }
             )
-        
+
+        # ── Recover orphan pages ───────────────────────────────────────────
+        # Pages that appear BEFORE the first shipper-marker boundary are not
+        # included in any document above.  This happens when the PDF starts with
+        # DGD forms or other non-AWB pages whose OCR text doesn't contain the
+        # "Shipper's Name and Address" / "Shipper's Account Number" markers
+        # (e.g. "SHIPPER'S DECLARATION FOR DANGEROUS GOODS" header pages).
+        # Those pages carry valid AWB numbers (the DGD form always prints the
+        # MAWB number), so we recover them via the AWB-number-based strategy.
+        if documents:
+            min_page = min(page_texts.keys())
+            first_doc_start = documents[0]["start_page"]
+            if first_doc_start > min_page:
+                orphan_texts = {p: t for p, t in page_texts.items() if p < first_doc_start}
+                orphan_docs = self._presplit_by_awb_as_markers(orphan_texts, {})
+                documents = orphan_docs + documents
+
         return documents
 
     def _extract_awb_number_from_page(self, page_text: str) -> Optional[str]:

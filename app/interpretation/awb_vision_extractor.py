@@ -14,11 +14,26 @@ from .awb_llm_parser import parse_llm_json
 
 
 class AwbVisionExtractor:
-    """Extract AWB fields using Claude Vision."""
+    """Extract AWB fields using a configurable vision provider."""
 
-    def __init__(self) -> None:
-        from app.llm.claude_vision_provider import ClaudeVisionProvider
-        self._provider = ClaudeVisionProvider()
+    def __init__(
+        self,
+        provider_name: str = "claude",
+        png_folder: Optional[str] = None,
+        json_folder: Optional[str] = None,
+        group_label: Optional[str] = None,
+    ) -> None:
+        self.provider_name = (provider_name or "claude").strip().lower()
+        if self.provider_name == "msc_tech_ai" or self.provider_name == "msc-tech-ai" or self.provider_name == "msc-tech":
+            from app.llm.msc_tech_ai_provider import MscTechAiProvider
+            self._provider = MscTechAiProvider(
+                png_folder=png_folder,
+                json_folder=json_folder,
+                group_label=group_label,
+            )
+        else:
+            from app.llm.claude_vision_provider import ClaudeVisionProvider
+            self._provider = ClaudeVisionProvider()
 
     # ------------------------------------------------------------------
 
@@ -28,12 +43,21 @@ class AwbVisionExtractor:
         start_page: int = 0,
         end_page: int = 0,
         page_rotations: Optional[Dict[int, int]] = None,
+        awb_number: Optional[str] = None,
+        group_label: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Send PDF page images to Claude Vision and return a structured dict.
         Returns the flat MAWB-only schema (legacy, single-AWB extraction).
         """
-        raw_json = self._provider.extract_awb_json(pdf_bytes, start_page, end_page, page_rotations)
+        raw_json = self._provider.extract_awb_json(
+            pdf_bytes,
+            start_page,
+            end_page,
+            page_rotations,
+            awb_number=awb_number,
+            group_label=group_label,
+        )
         parsed = parse_llm_json(raw_json)
         return parsed.data
 
@@ -43,6 +67,8 @@ class AwbVisionExtractor:
         start_page: int = 0,
         end_page: int = 0,
         page_rotations: Optional[Dict[int, int]] = None,
+        awb_number: Optional[str] = None,
+        group_label: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Send all pages of a MAWB block (MAWB + HAWBs) to Claude Vision and
@@ -59,7 +85,12 @@ class AwbVisionExtractor:
         Falls back to flat MAWB-only extraction if Claude returns the old format.
         """
         raw_json = self._provider.extract_mawb_with_hawbs_json(
-            pdf_bytes, start_page, end_page, page_rotations=page_rotations
+            pdf_bytes,
+            start_page,
+            end_page,
+            page_rotations=page_rotations,
+            awb_number=awb_number,
+            group_label=group_label,
         )
 
         # Try to parse as the new nested format first.
@@ -80,17 +111,26 @@ class AwbVisionExtractor:
         if "mawb" not in data:
             return {"mawb": data, "hawbs": []}
 
+        # Some providers may return a null MAWB object. Treat that as an empty
+        # dict so downstream UI code can safely attach the AWB number.
+        if data.get("mawb") is None:
+            data["mawb"] = {}
+
         # Ensure hawbs is always a list
         if not isinstance(data.get("hawbs"), list):
             data["hawbs"] = []
 
         return data
 
-    def extract_from_text(self, ocr_text: str) -> Dict[str, Any]:
+    def extract_from_text(self, ocr_text: str, awb_number: Optional[str] = None, group_label: Optional[str] = None) -> Dict[str, Any]:
         """
         Fallback: send raw OCR text to Claude (no image).
         Used when PDF bytes are unavailable (e.g. legacy text-only splits).
         """
-        raw_json = self._provider.extract_from_text(ocr_text)
+        raw_json = self._provider.extract_from_text(
+            ocr_text,
+            awb_number=awb_number,
+            group_label=group_label,
+        )
         parsed = parse_llm_json(raw_json)
         return parsed.data

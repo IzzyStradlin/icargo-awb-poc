@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
+import time
 import zipfile
+from pathlib import Path
 from typing import Optional
 
 import requests
 import streamlit as st
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 
 from app.extraction.pdf_text_extractor import PDFTextExtractor
 from app.extraction.awb_document_presplitter import AwbDocumentPreSplitter
@@ -25,11 +28,38 @@ from app.ui.assets.branding import get_colors, get_brand_info
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 
 # ── Cached Vision extractor ────────────────────────────────────────────────
 @st.cache_resource
-def get_claude_vision() -> AwbVisionExtractor:
-    return AwbVisionExtractor()
+def get_vision_extractor(
+    provider_name: str = "msc_tech_ai",
+    png_folder: Optional[str] = None,
+    json_folder: Optional[str] = None,
+    group_label: Optional[str] = None,
+) -> AwbVisionExtractor:
+    return AwbVisionExtractor(
+        provider_name=provider_name,
+        png_folder=png_folder,
+        json_folder=json_folder,
+        group_label=group_label,
+    )
+
+
+def _persist_msc_tech_env(key: str, value: str) -> None:
+    """Persist MSC Tech AI environment variables to .env (best effort)."""
+    try:
+        env_path = Path(".env")
+        env_path.touch(exist_ok=True)
+        set_key(str(env_path), key, value)
+    except (PermissionError, OSError) as e:
+        # If .env is locked (by Streamlit or OneDrive), just set in memory
+        # This allows the app to continue running even if file persistence fails
+        logger.warning(f"Failed to persist {key} to .env: {e} — using in-memory only")
+    finally:
+        # Always set in memory so the value is available for this session
+        os.environ[key] = value
 
 
 # ── iCargo IBS client ──────────────────────────────────────────────────────
@@ -42,6 +72,15 @@ class ICargoIBSClient:
         self.token = None
         if not self.username or not self.password:
             raise RuntimeError("ICARGO_USERNAME / ICARGO_PASSWORD missing in .env")
+
+    def _ensure_preprod_write(self):
+        # Hard safety guard: write operations are allowed only on preprod stage.
+        allowed_host = "https://mac-stag-icargo.ibsplc.aero"
+        if not self.base_url.lower().startswith(allowed_host):
+            raise RuntimeError(
+                "Write blocked: iCargo update is allowed only on preprod stage "
+                f"({allowed_host}). Current base URL: {self.base_url}"
+            )
 
     def authenticate(self):
         url = f"{self.base_url}/auth/m4/private/v1/authenticate"
@@ -58,21 +97,82 @@ class ICargoIBSClient:
     def _headers(self):
         if not self.token:
             self.authenticate()
-        return {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
+        # Prod-like behavior: Authorization Bearer is the primary working mode.
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    def _auth_header_variants(self) -> list[dict]:
+        if not self.token:
+            self.authenticate()
+        token = self.token or ""
+        return [
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            {
+                "ICO-Authorization": token,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        ]
+
+    def _request(self, method: str, url: str, json_body=None):
+        """Execute an iCargo HTTP call with one automatic token refresh retry.
+
+        If the token is expired (401 invalid_token), refresh and retry once.
+        """
+        with requests.Session() as session:
+            # First attempt with default header set.
+            r = session.request(method, url, json=json_body, headers=self._headers(), timeout=self.timeout)
+            if r.status_code != 401:
+                return r
+
+            # On any 401, force token refresh and retry with header variants.
+            self.token = None
+            self.authenticate()
+
+            last_response = r
+            for headers in self._auth_header_variants():
+                last_response = session.request(method, url, json=json_body, headers=headers, timeout=self.timeout)
+                if last_response.status_code != 401:
+                    return last_response
+
+            return last_response
 
     def get_awb(self, awb_code: str) -> dict:
         url = f"{self.base_url}/icargo-api/m4/enterprise/v2/awbs/{awb_code}"
-        r = requests.get(url, headers=self._headers(), timeout=self.timeout)
+        r = self._request("GET", url)
         if r.status_code != 200:
             raise RuntimeError(f"Error GET AWB: {r.status_code} {r.text}")
         return r.json()
 
     def get_hawbs(self, mawb_code: str) -> dict:
         url = f"{self.base_url}/icargo-api/m4/enterprise/v2/awbs/{mawb_code}/hawbs"
-        r = requests.get(url, headers=self._headers(), timeout=self.timeout)
+        r = self._request("GET", url)
         if r.status_code != 200:
             raise RuntimeError(f"Error GET HAWBs: {r.status_code} {r.text}")
         return r.json()
+
+    def save_awb(self, awb_code: str, payload: dict) -> str:
+        self._ensure_preprod_write()
+        url = f"{self.base_url}/icargo-api/m4/enterprise/v2/awbs/{awb_code}"
+        r = self._request("POST", url, json_body=payload)
+        if r.status_code != 200:
+            raise RuntimeError(f"Error POST AWB: {r.status_code} {r.text}")
+        return r.text or "AWB data updated successfully"
+
+    def save_hawbs(self, awb_code: str, payload: list[dict]) -> str:
+        self._ensure_preprod_write()
+        url = f"{self.base_url}/icargo-api/m4/enterprise/v2/awbs/{awb_code}/hawbs"
+        r = self._request("POST", url, json_body=payload)
+        if r.status_code != 200:
+            raise RuntimeError(f"Error POST HAWBs: {r.status_code} {r.text}")
+        return r.text or "HAWB data updated successfully"
 
 
 # ── AWB form renderer ──────────────────────────────────────────────────────
@@ -89,6 +189,478 @@ def _fmt_addr(data: dict, prefix: str) -> str:
         data.get(f"{prefix}_country"),
     ]
     return ", ".join(p for p in parts if p) or "—"
+
+
+def _normalise_awb(awb_raw: str) -> str:
+    """Normalize AWB to XXX-XXXXXXXX when 11 digits are provided."""
+    digits_only = re.sub(r"\D", "", (awb_raw or ""))
+    if digits_only.isdigit() and len(digits_only) == 11:
+        return f"{digits_only[:3]}-{digits_only[3:]}"
+    return (awb_raw or "").strip()
+
+
+def _resolve_awb_for_icargo(awb_num: str, mawb_data: dict | None = None) -> str:
+    """Resolve a usable AWB for iCargo from multiple possible sources."""
+    candidates: list[str] = []
+
+    if awb_num:
+        candidates.append(str(awb_num))
+
+    if isinstance(mawb_data, dict):
+        awb_field = mawb_data.get("awb_number")
+        if awb_field:
+            candidates.append(str(awb_field))
+
+        prefix = str(mawb_data.get("awb_prefix") or "").strip()
+        serial = str(mawb_data.get("awb_serial") or "").strip()
+        prefix_digits = re.sub(r"\D", "", prefix)
+        serial_digits = re.sub(r"\D", "", serial)
+        if len(prefix_digits) == 3 and len(serial_digits) == 8:
+            candidates.append(f"{prefix_digits}{serial_digits}")
+
+    for candidate in candidates:
+        normalized = _normalise_awb(candidate)
+        if normalized and re.fullmatch(r"\d{3}-\d{8}", normalized):
+            return normalized
+
+    return ""
+
+
+def _to_records(table_like) -> list[dict]:
+    if table_like is None:
+        return []
+    if isinstance(table_like, list):
+        return [r for r in table_like if isinstance(r, dict)]
+    if hasattr(table_like, "to_dict"):
+        try:
+            return table_like.to_dict("records")
+        except Exception:
+            return []
+    return []
+
+
+def _selected_fields_from_rows(rows: list[dict]) -> set[str]:
+    selected: set[str] = set()
+    for row in rows:
+        if bool(row.get("apply")):
+            field = str(row.get("field") or "").strip()
+            if field:
+                selected.add(field)
+    return selected
+
+
+def _edited_pdf_values_from_rows(rows: list[dict]) -> dict[str, object]:
+    edited: dict[str, object] = {}
+    for row in rows:
+        if not bool(row.get("apply")):
+            continue
+        field = str(row.get("field") or "").strip()
+        if not field:
+            continue
+        edited[field] = row.get("pdf_llm")
+    return edited
+
+
+def _to_int(value) -> Optional[int]:
+    if value in (None, "", "—"):
+        return None
+    try:
+        if isinstance(value, str):
+            value = value.replace(",", ".")
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _to_float(value) -> Optional[float]:
+    if value in (None, "", "—"):
+        return None
+    try:
+        if isinstance(value, str):
+            value = value.replace(",", ".")
+        return float(value)
+    except Exception:
+        return None
+
+
+def _coalesce_value(field: str, edited_values: dict[str, object], extracted_values: dict) -> object:
+    if field in edited_values:
+        return edited_values.get(field)
+    return extracted_values.get(field)
+
+
+MAWB_POST_EDITABLE_FIELDS = [
+    "origin",
+    "destination",
+    "pieces",
+    "weight",
+    "chargeable_weight",
+    "volume",
+    "goods_description",
+    "currency",
+    "rate",
+    "total_charge",
+    "declared_value_carriage",
+    "declared_value_customs",
+    "shipper",
+    "consignee",
+    "agent",
+    "notify_party",
+    "flight_number",
+    "flight_date",
+    "hs_code",
+    "special_handling",
+    "unit_weight",
+    "unit_volume",
+    "unit_length",
+    "nature_of_goods",
+    "commodity",
+]
+
+
+HAWB_POST_EDITABLE_FIELDS = [
+    "hawb_number",
+    "origin",
+    "destination",
+    "pieces",
+    "weight",
+    "chargeable_weight",
+    "volume",
+    "goods_description",
+    "currency",
+    "rate",
+    "total_charge",
+    "declared_value_carriage",
+    "declared_value_customs",
+    "shipper",
+    "consignee",
+    "notify_party",
+    "flight_number",
+    "flight_date",
+    "hs_code",
+    "special_handling",
+    "dimensions",
+    "unit_weight",
+    "unit_volume",
+    "unit_length",
+]
+
+
+def _to_editor_cell(value) -> Optional[str]:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _augment_rows_with_post_fields(rows: list[dict], source_data: dict, post_fields: list[str]) -> list[dict]:
+    out: list[dict] = [dict(r) for r in rows if isinstance(r, dict)]
+    existing_fields = {str(r.get("field") or "").strip() for r in out}
+
+    for field in post_fields:
+        if field in existing_fields:
+            continue
+        out.append({
+            "field": field,
+            "pdf_llm": _to_editor_cell((source_data or {}).get(field)),
+            "icargo": None,
+            "match": True,
+            "_extra_post_field": True,
+        })
+
+    return out
+
+
+def _editor_rows_with_apply(rows: list[dict], default_apply_mismatch: bool = True) -> list[dict]:
+    editor_rows: list[dict] = []
+    for row in rows:
+        is_extra = bool(row.get("_extra_post_field"))
+        cleaned = {k: v for k, v in row.items() if k != "_extra_post_field"}
+        cleaned["apply"] = False if is_extra else (default_apply_mismatch and (not bool(cleaned.get("match"))))
+        editor_rows.append(cleaned)
+    return editor_rows
+
+
+def _build_awb_update_payload(
+    base_awb: dict,
+    extracted_mawb: dict,
+    selected_fields: set[str],
+    edited_values: dict[str, object],
+    awb_code: str,
+) -> dict:
+    payload = dict(base_awb or {})
+    payload["awb"] = awb_code
+
+    def _ensure(path_root: str) -> dict:
+        obj = payload.get(path_root)
+        if not isinstance(obj, dict):
+            obj = {}
+            payload[path_root] = obj
+        return obj
+
+    origin_v = _coalesce_value("origin", edited_values, extracted_mawb)
+    destination_v = _coalesce_value("destination", edited_values, extracted_mawb)
+    pieces_v = _coalesce_value("pieces", edited_values, extracted_mawb)
+    weight_v = _coalesce_value("weight", edited_values, extracted_mawb)
+    chargeable_weight_v = _coalesce_value("chargeable_weight", edited_values, extracted_mawb)
+    volume_v = _coalesce_value("volume", edited_values, extracted_mawb)
+    goods_v = _coalesce_value("goods_description", edited_values, extracted_mawb)
+    currency_v = _coalesce_value("currency", edited_values, extracted_mawb)
+    rate_v = _coalesce_value("rate", edited_values, extracted_mawb)
+    total_charge_v = _coalesce_value("total_charge", edited_values, extracted_mawb)
+    declared_value_carriage_v = _coalesce_value("declared_value_carriage", edited_values, extracted_mawb)
+    declared_value_customs_v = _coalesce_value("declared_value_customs", edited_values, extracted_mawb)
+    shipper_v = _coalesce_value("shipper", edited_values, extracted_mawb)
+    consignee_v = _coalesce_value("consignee", edited_values, extracted_mawb)
+    agent_v = _coalesce_value("agent", edited_values, extracted_mawb)
+    notify_party_v = _coalesce_value("notify_party", edited_values, extracted_mawb)
+    flight_date_v = _coalesce_value("flight_date", edited_values, extracted_mawb)
+    flight_num_v = _coalesce_value("flight_number", edited_values, extracted_mawb)
+    hs_code_v = _coalesce_value("hs_code", edited_values, extracted_mawb)
+    special_handling_v = _coalesce_value("special_handling", edited_values, extracted_mawb)
+    unit_weight_v = _coalesce_value("unit_weight", edited_values, extracted_mawb)
+    unit_volume_v = _coalesce_value("unit_volume", edited_values, extracted_mawb)
+    unit_length_v = _coalesce_value("unit_length", edited_values, extracted_mawb)
+    nature_of_goods_v = _coalesce_value("nature_of_goods", edited_values, extracted_mawb)
+    commodity_v = _coalesce_value("commodity", edited_values, extracted_mawb)
+
+    if "origin" in selected_fields and origin_v:
+        payload["origin"] = str(origin_v).strip().upper()
+    if "destination" in selected_fields and destination_v:
+        payload["destination"] = str(destination_v).strip().upper()
+    if "pieces" in selected_fields:
+        p_int = _to_int(pieces_v)
+        if p_int is not None:
+            payload["stated_pieces"] = p_int
+    if "weight" in selected_fields:
+        w_float = _to_float(weight_v)
+        if w_float is not None:
+            payload["stated_weight"] = w_float
+    if "chargeable_weight" in selected_fields:
+        cw_float = _to_float(chargeable_weight_v)
+        if cw_float is not None:
+            payload["chargeable_weight"] = cw_float
+    if "volume" in selected_fields:
+        vol_float = _to_float(volume_v)
+        if vol_float is not None:
+            payload["volume"] = vol_float
+    if "goods_description" in selected_fields and goods_v:
+        payload["shipment_description"] = str(goods_v)
+    if "currency" in selected_fields and currency_v:
+        payload["currency"] = str(currency_v).strip().upper()
+    if "rate" in selected_fields:
+        rate_float = _to_float(rate_v)
+        if rate_float is not None:
+            payload["rate"] = rate_float
+    if "total_charge" in selected_fields:
+        total_charge_float = _to_float(total_charge_v)
+        if total_charge_float is not None:
+            payload["total_charge"] = total_charge_float
+    if "declared_value_carriage" in selected_fields and declared_value_carriage_v not in (None, "", "—"):
+        payload["declared_value_carriage"] = str(declared_value_carriage_v)
+    if "declared_value_customs" in selected_fields and declared_value_customs_v not in (None, "", "—"):
+        payload["declared_value_customs"] = str(declared_value_customs_v)
+
+    if "shipper" in selected_fields and shipper_v:
+        shipper = _ensure("shipper")
+        shipper["name"] = str(shipper_v)
+    if "consignee" in selected_fields and consignee_v:
+        consignee = _ensure("consignee")
+        consignee["name"] = str(consignee_v)
+    if "agent" in selected_fields and agent_v:
+        agent = _ensure("agent")
+        agent["agent_name"] = str(agent_v)
+    if "notify_party" in selected_fields and notify_party_v:
+        notify_party = _ensure("notify_party")
+        notify_party["name"] = str(notify_party_v)
+
+    if "flight_date" in selected_fields and flight_date_v:
+        payload["date_of_journey"] = str(flight_date_v)
+
+    if "flight_number" in selected_fields and flight_num_v:
+        raw_flight = str(flight_num_v or "").strip().upper()
+        carrier = "".join(ch for ch in raw_flight[:2] if ch.isalpha())
+        flight_number = "".join(ch for ch in raw_flight[2:] if ch.isdigit())
+        if carrier and flight_number:
+            payload["requested_flight"] = [{
+                "carrier_code": carrier,
+                "flight_number": flight_number,
+                "flight_date": str(flight_date_v or payload.get("date_of_journey") or ""),
+                "origin": payload.get("origin"),
+                "destination": payload.get("destination"),
+            }]
+
+    if "hs_code" in selected_fields and hs_code_v:
+        payload["harmonised_commodity_code"] = str(hs_code_v)
+
+    if "special_handling" in selected_fields and special_handling_v:
+        shc = str(special_handling_v).replace(";", ",")
+        payload["handling_codes"] = [c.strip() for c in shc.split(",") if c.strip()]
+
+    if "unit_weight" in selected_fields and unit_weight_v:
+        uom = _ensure("unit_of_measures")
+        uom["weight"] = str(unit_weight_v).strip().lower()
+    if "unit_volume" in selected_fields and unit_volume_v:
+        uom = _ensure("unit_of_measures")
+        uom["volume"] = str(unit_volume_v).strip().lower()
+    if "unit_length" in selected_fields and unit_length_v:
+        uom = _ensure("unit_of_measures")
+        uom["length"] = str(unit_length_v).strip().lower()
+
+    # Ensure minimal required structures remain present.
+    payload.setdefault("unit_of_measures", {"weight": "kg", "volume": "cbm", "length": "m"})
+    payload.setdefault("routing", [{"destination": payload.get("destination"), "carrier": "XX"}])
+    payload.setdefault("applicable_charges", {"rating_details": [{
+        "nature_of_goods": payload.get("shipment_description") or "GENERAL CARGO",
+        "pieces": payload.get("stated_pieces") or 1,
+        "weight": payload.get("stated_weight") or 0.0,
+        "commodity": "GEN",
+    }]})
+
+    rating_details = payload.get("applicable_charges", {}).get("rating_details", [])
+    if not isinstance(rating_details, list) or not rating_details:
+        payload.setdefault("applicable_charges", {})
+        payload["applicable_charges"]["rating_details"] = [{
+            "nature_of_goods": payload.get("shipment_description") or "GENERAL CARGO",
+            "pieces": payload.get("stated_pieces") or 1,
+            "weight": payload.get("stated_weight") or 0.0,
+            "commodity": "GEN",
+        }]
+        rating_details = payload["applicable_charges"]["rating_details"]
+
+    # iCargo validation rule: stated pieces/weight must match rating pieces/weight.
+    # Keep rating_details[0] aligned with current payload values to avoid ICO_AWB_009.
+    if payload.get("stated_pieces") is not None:
+        rating_details[0]["pieces"] = payload.get("stated_pieces")
+    if payload.get("stated_weight") is not None:
+        rating_details[0]["weight"] = payload.get("stated_weight")
+
+    if "nature_of_goods" in selected_fields and nature_of_goods_v:
+        rating_details[0]["nature_of_goods"] = str(nature_of_goods_v)
+    if "commodity" in selected_fields and commodity_v:
+        rating_details[0]["commodity"] = str(commodity_v)
+
+    return payload
+
+
+def _build_hawb_detail_payload(
+    awb_code: str,
+    hawb_data: dict,
+    selected_fields: set[str],
+    edited_values: dict[str, object],
+) -> dict:
+    out: dict = {}
+    hawb_num_v = _coalesce_value("hawb_number", edited_values, hawb_data)
+    hawb_num = str(hawb_num_v or hawb_data.get("hawb") or "").strip()
+    out["awb"] = awb_code
+    out["hawb"] = hawb_num
+
+    # Required by API schema (always provide from extracted values/fallbacks)
+    origin_v = _coalesce_value("origin", edited_values, hawb_data)
+    destination_v = _coalesce_value("destination", edited_values, hawb_data)
+    pieces_v = _coalesce_value("pieces", edited_values, hawb_data)
+    weight_v = _coalesce_value("weight", edited_values, hawb_data)
+    goods_v = _coalesce_value("goods_description", edited_values, hawb_data)
+    shipper_v = _coalesce_value("shipper", edited_values, hawb_data)
+    consignee_v = _coalesce_value("consignee", edited_values, hawb_data)
+    hs_code_v = _coalesce_value("hs_code", edited_values, hawb_data)
+    special_handling_v = _coalesce_value("special_handling", edited_values, hawb_data)
+
+    out["origin"] = str(origin_v or "").strip().upper()
+    out["destination"] = str(destination_v or "").strip().upper()
+    out["pieces"] = _to_int(pieces_v) or 0
+    out["weight"] = _to_float(weight_v) or 0.0
+    out["shipment_description"] = str(goods_v or "GENERAL CARGO")
+    out["unit_of_measures"] = {"weight": "kg", "volume": "cbm", "length": "m"}
+
+    chargeable_weight_v = _coalesce_value("chargeable_weight", edited_values, hawb_data)
+    volume_v = _coalesce_value("volume", edited_values, hawb_data)
+    currency_v = _coalesce_value("currency", edited_values, hawb_data)
+    rate_v = _coalesce_value("rate", edited_values, hawb_data)
+    total_charge_v = _coalesce_value("total_charge", edited_values, hawb_data)
+    declared_value_carriage_v = _coalesce_value("declared_value_carriage", edited_values, hawb_data)
+    declared_value_customs_v = _coalesce_value("declared_value_customs", edited_values, hawb_data)
+    notify_party_v = _coalesce_value("notify_party", edited_values, hawb_data)
+    flight_date_v = _coalesce_value("flight_date", edited_values, hawb_data)
+    flight_num_v = _coalesce_value("flight_number", edited_values, hawb_data)
+    dimensions_v = _coalesce_value("dimensions", edited_values, hawb_data)
+    unit_weight_v = _coalesce_value("unit_weight", edited_values, hawb_data)
+    unit_volume_v = _coalesce_value("unit_volume", edited_values, hawb_data)
+    unit_length_v = _coalesce_value("unit_length", edited_values, hawb_data)
+
+    # Optional mapped fields when selected
+    if "hs_code" in selected_fields and hs_code_v:
+        out["harmonised_commodity_code"] = str(hs_code_v)
+    if "special_handling" in selected_fields and special_handling_v:
+        shc = str(special_handling_v or "").replace(";", ",")
+        out["handling_codes"] = [c.strip() for c in shc.split(",") if c.strip()]
+    if "shipper" in selected_fields and shipper_v:
+        out["shipper"] = {
+            "name": str(shipper_v),
+            "address": hawb_data.get("shipper_street") or "",
+            "city": hawb_data.get("shipper_city") or "",
+            "state": hawb_data.get("shipper_province") or "",
+            "post_code": hawb_data.get("shipper_zip") or "",
+            "country": hawb_data.get("shipper_country") or "",
+        }
+    if "consignee" in selected_fields and consignee_v:
+        out["consignee"] = {
+            "name": str(consignee_v),
+            "address": hawb_data.get("consignee_street") or "",
+            "city": hawb_data.get("consignee_city") or "",
+            "state": hawb_data.get("consignee_province") or "",
+            "post_code": hawb_data.get("consignee_zip") or "",
+            "country": hawb_data.get("consignee_country") or "",
+        }
+
+    if "notify_party" in selected_fields and notify_party_v:
+        out["notify_party"] = {"name": str(notify_party_v)}
+
+    if "chargeable_weight" in selected_fields:
+        cw_float = _to_float(chargeable_weight_v)
+        if cw_float is not None:
+            out["chargeable_weight"] = cw_float
+    if "volume" in selected_fields:
+        vol_float = _to_float(volume_v)
+        if vol_float is not None:
+            out["volume"] = vol_float
+    if "currency" in selected_fields and currency_v:
+        out["currency"] = str(currency_v).strip().upper()
+    if "rate" in selected_fields:
+        rate_float = _to_float(rate_v)
+        if rate_float is not None:
+            out["rate"] = rate_float
+    if "total_charge" in selected_fields:
+        total_charge_float = _to_float(total_charge_v)
+        if total_charge_float is not None:
+            out["total_charge"] = total_charge_float
+    if "declared_value_carriage" in selected_fields and declared_value_carriage_v not in (None, "", "—"):
+        out["declared_value_carriage"] = str(declared_value_carriage_v)
+    if "declared_value_customs" in selected_fields and declared_value_customs_v not in (None, "", "—"):
+        out["declared_value_customs"] = str(declared_value_customs_v)
+
+    if ("flight_date" in selected_fields and flight_date_v) or ("flight_number" in selected_fields and flight_num_v):
+        raw_flight = str(flight_num_v or "").strip().upper()
+        carrier = "".join(ch for ch in raw_flight[:2] if ch.isalpha())
+        flight_number = "".join(ch for ch in raw_flight[2:] if ch.isdigit())
+        out["requested_flight"] = [{
+            "carrier_code": carrier,
+            "flight_number": flight_number,
+            "flight_date": str(flight_date_v or ""),
+            "origin": out.get("origin"),
+            "destination": out.get("destination"),
+        }]
+
+    if "dimensions" in selected_fields and dimensions_v:
+        out["dimensions"] = str(dimensions_v)
+
+    if "unit_weight" in selected_fields and unit_weight_v:
+        out["unit_of_measures"]["weight"] = str(unit_weight_v).strip().lower()
+    if "unit_volume" in selected_fields and unit_volume_v:
+        out["unit_of_measures"]["volume"] = str(unit_volume_v).strip().lower()
+    if "unit_length" in selected_fields and unit_length_v:
+        out["unit_of_measures"]["length"] = str(unit_length_v).strip().lower()
+
+    return out
 
 
 def _awb_form(awb_num: str, data: dict):
@@ -283,6 +855,40 @@ def _extract_pdfs_from_upload(uploaded) -> list[dict]:
     return [{"name": uploaded.name, "bytes": raw}]
 
 
+def _list_polling_pdf_files(input_dir: str | Path, processed_dir: str | Path) -> list[Path]:
+    input_path = Path(input_dir).expanduser()
+    processed_path = Path(processed_dir).expanduser()
+    input_path.mkdir(parents=True, exist_ok=True)
+    processed_path.mkdir(parents=True, exist_ok=True)
+    return sorted(path for path in input_path.glob("*.pdf") if path.is_file())
+
+
+def _load_next_polling_pdf(input_dir: str | Path, processed_dir: str | Path) -> dict | None:
+    pdf_paths = _list_polling_pdf_files(input_dir=input_dir, processed_dir=processed_dir)
+    if not pdf_paths:
+        return None
+    next_path = pdf_paths[0]
+    return {
+        "name": next_path.name,
+        "bytes": next_path.read_bytes(),
+        "path": next_path,
+    }
+
+
+def _move_polling_file_to_processed(file_path: str | Path, processed_dir: str | Path) -> Path:
+    source = Path(file_path).expanduser()
+    dest_dir = Path(processed_dir).expanduser()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    destination = dest_dir / source.name
+    if destination.exists():
+        unique_suffix = int(time.time() * 1000)
+        destination = dest_dir / f"{source.stem}_{unique_suffix}{source.suffix}"
+
+    source.replace(destination)
+    return destination
+
+
 # ── Main page ──────────────────────────────────────────────────────────────
 def render_pdf_upload(on_back):
     st.markdown(
@@ -290,7 +896,7 @@ def render_pdf_upload(on_back):
         <section class="msc-page-header">
             <div class="msc-kicker">PDF workflow</div>
             <h1>AWB extraction</h1>
-            <p>Upload a PDF — Claude Vision automatically detects and fills all AWB fields.</p>
+            <p>Upload a PDF and choose between Claude Vision (cloud API) or MSC Tech AI (file-based) for AWB extraction.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -309,52 +915,171 @@ def render_pdf_upload(on_back):
         "split_mode": "fast",
         "awb_results": None,
         "vision_refined_awbs": {},
+        "icargo_compare_cache": {},
         "debug_page_texts": None,
         "debug_pdf_name": None,
+        "folder_polling": False,
+        "polling_input_dir": r"C:\TEMP\POC",
+        "polling_processed_dir": r"C:\TEMP\POC\PROCESSED",
+        "polling_current_path": None,
     }.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
-    # ── Upload ─────────────────────────────────────────────────────────────
-    uploaded = st.file_uploader(
-        "Select a PDF or a ZIP archive containing PDFs",
-        type=["pdf", "zip"],
+    polling_mode = bool(st.session_state.get("folder_polling", False))
+    polling_input_dir = Path(st.session_state.get("polling_input_dir", r"C:\TEMP\POC")).expanduser()
+    polling_processed_dir = Path(st.session_state.get("polling_processed_dir", r"C:\TEMP\POC\PROCESSED")).expanduser()
+    current_source_name = ""
+
+    if polling_mode:
+        st.info(
+            "📡 Polling folder mode enabled. The app is watching "
+            f"**{polling_input_dir}** and will process one PDF at a time."
+        )
+        st.caption(
+            "Processed files will be moved to "
+            f"**{polling_processed_dir}** once you confirm the simulated iCargo update."
+        )
+
+    # ── Provider selection ───────────────────────────────────────────────
+    provider_name = st.selectbox(
+        "Vision provider",
+        options=["claude", "msc_tech_ai"],
+        format_func=lambda v: {
+            "claude": "Claude Vision (API)",
+            "msc_tech_ai": "MSC Tech AI (File-based)"
+        }.get(v, v),
+        index=1,
+        key="vision_provider_select",
     )
-    if not uploaded:
-        st.info("Upload a PDF or a ZIP archive containing PDFs to get started.")
-        return
 
-    # Normalise upload → list of PDFs; only re-parse when the file changes.
-    if st.session_state.get("pdf_name") != uploaded.name:
-        batch_pdfs = _extract_pdfs_from_upload(uploaded)
-        if not batch_pdfs:
-            st.error("No PDF files found in the archive.")
+    if provider_name == "msc_tech_ai":
+        st.info(
+            "MSC Tech AI mode: send PNGs and receive JSON results via either a local OneDrive-synced folder or a browser-accessible SharePoint/OneDrive URL. "
+            "The app resolves browser URLs to the local OneDrive sync folder of the current user, and the selected folders are persisted in .env."
+        )
+        st.markdown(
+            "**Nota:** l'utente che esegue l'app deve avere la libreria SharePoint sincronizzata con OneDrive. "
+            "Inserisci un percorso locale o un URL SharePoint/OneDrive; l'app proverà a risolvere l'URL in un percorso locale valido."
+        )
+
+        if "msc_png_folder" not in st.session_state:
+            st.session_state["msc_png_folder"] = os.getenv("MSC_TECH_PNG_FOLDER", "")
+        if "msc_json_folder" not in st.session_state:
+            st.session_state["msc_json_folder"] = os.getenv("MSC_TECH_JSON_FOLDER", "")
+        if "msc_group_label" not in st.session_state:
+            st.session_state["msc_group_label"] = os.getenv("MSC_TECH_GROUP_LABEL", "default")
+
+        png_folder = st.text_input(
+            "PNG inbox folder or SharePoint folder URL",
+            key="msc_png_folder",
+            placeholder="C:/Users/.../OneDrive - YourSharePointFolder/png-in or https://...",
+        )
+
+        json_folder = st.text_input(
+            "JSON output folder or SharePoint folder URL",
+            key="msc_json_folder",
+            placeholder="C:/Users/.../OneDrive - YourSharePointFolder/json-out or https://...",
+        )
+
+        group_label = st.text_input(
+            "MAWB + HAWB group label",
+            key="msc_group_label",
+            placeholder="e.g. MAWB-001",
+        )
+
+        if png_folder:
+            _persist_msc_tech_env("MSC_TECH_PNG_FOLDER", png_folder)
+        if json_folder:
+            _persist_msc_tech_env("MSC_TECH_JSON_FOLDER", json_folder)
+        if group_label:
+            _persist_msc_tech_env("MSC_TECH_GROUP_LABEL", group_label)
+
+    # ── Upload / polling selection ───────────────────────────────────────
+    uploaded = None
+    if polling_mode:
+        polling_pdf = _load_next_polling_pdf(input_dir=polling_input_dir, processed_dir=polling_processed_dir)
+        if polling_pdf is None:
+            st.warning("⏳ No PDF found yet in the polling folder. Waiting for the next file...")
+            col_wait, col_stop = st.columns([2, 1])
+            with col_wait:
+                if st.button("🔁 Refresh polling folder", type="secondary"):
+                    st.rerun()
+            with col_stop:
+                if st.button("🛑 Stop polling mode", type="secondary"):
+                    st.session_state["folder_polling"] = False
+                    st.session_state["polling_current_path"] = None
+                    st.rerun()
             return
-        st.session_state["pdf_name"] = uploaded.name
-        st.session_state["batch_pdfs"] = batch_pdfs
-        st.session_state["raw_pdf_bytes"] = batch_pdfs[0]["bytes"]
-        st.session_state["split_documents"] = None
-        st.session_state["awb_results"] = None
-        st.session_state["vision_refined_awbs"] = {}
-        st.session_state["debug_page_texts"] = None
-        st.session_state["debug_pdf_name"] = None
 
-    batch_pdfs: list[dict] = st.session_state["batch_pdfs"]
-    if not batch_pdfs:
-        st.error("No PDF files to process. Please re-upload the file.")
-        return
+        current_poll_path = str(polling_pdf["path"])
+        if st.session_state.get("polling_current_path") != current_poll_path:
+            st.session_state["pdf_name"] = polling_pdf["name"]
+            st.session_state["batch_pdfs"] = [{"name": polling_pdf["name"], "bytes": polling_pdf["bytes"]}]
+            st.session_state["raw_pdf_bytes"] = polling_pdf["bytes"]
+            st.session_state["split_documents"] = None
+            st.session_state["awb_results"] = None
+            st.session_state["vision_refined_awbs"] = {}
+            st.session_state["debug_page_texts"] = None
+            st.session_state["debug_pdf_name"] = None
+            st.session_state["polling_current_path"] = current_poll_path
+            st.rerun()
+
+        batch_pdfs = st.session_state["batch_pdfs"]
+        raw_pdf = batch_pdfs[0]["bytes"]
+        is_zip = False
+        current_source_name = polling_pdf["name"]
+        st.success(f"📄 {polling_pdf['name']} — {len(raw_pdf):,} bytes (polling folder)")
+        st.info(f"📡 Current file from polling queue: {current_poll_path}")
+    else:
+        uploaded = st.file_uploader(
+            "Select a PDF or a ZIP archive containing PDFs",
+            type=["pdf", "zip"],
+        )
+        if not uploaded:
+            st.info("Upload a PDF or a ZIP archive containing PDFs to get started.")
+            return
+
+        # Normalise upload → list of PDFs; only re-parse when the file changes.
+        if st.session_state.get("pdf_name") != uploaded.name:
+            batch_pdfs = _extract_pdfs_from_upload(uploaded)
+            if not batch_pdfs:
+                st.error("No PDF files found in the archive.")
+                return
+            st.session_state["pdf_name"] = uploaded.name
+            st.session_state["batch_pdfs"] = batch_pdfs
+            st.session_state["raw_pdf_bytes"] = batch_pdfs[0]["bytes"]
+            st.session_state["split_documents"] = None
+            st.session_state["awb_results"] = None
+            st.session_state["vision_refined_awbs"] = {}
+            st.session_state["debug_page_texts"] = None
+            st.session_state["debug_pdf_name"] = None
+
+        batch_pdfs = st.session_state["batch_pdfs"]
+        if not batch_pdfs:
+            st.error("No PDF files to process. Please re-upload the file.")
+            return
+
+        raw_pdf = batch_pdfs[0]["bytes"]
+        is_zip = uploaded.name.lower().endswith(".zip")
+        current_source_name = uploaded.name
+
+        if is_zip:
+            st.success(f"📦 {uploaded.name} — {len(batch_pdfs)} PDF file(s) found")
+            with st.expander("📄 Files in archive", expanded=False):
+                for p in batch_pdfs:
+                    st.caption(f"• {p['name']} ({len(p['bytes']):,} bytes)")
+        else:
+            st.success(f"📄 {uploaded.name} — {uploaded.size:,} bytes")
+
+    if not polling_mode:
+        batch_pdfs = st.session_state["batch_pdfs"]
+        if not batch_pdfs:
+            st.error("No PDF files to process. Please re-upload the file.")
+            return
 
     # raw_pdf kept for single-file features (debug panel, PNG preview)
-    raw_pdf = batch_pdfs[0]["bytes"]
-    is_zip = uploaded.name.lower().endswith(".zip")
-
-    if is_zip:
-        st.success(f"📦 {uploaded.name} — {len(batch_pdfs)} PDF file(s) found")
-        with st.expander("📄 Files in archive", expanded=False):
-            for p in batch_pdfs:
-                st.caption(f"• {p['name']} ({len(p['bytes']):,} bytes)")
-    else:
-        st.success(f"📄 {uploaded.name} — {uploaded.size:,} bytes")
+    raw_pdf = st.session_state.get("raw_pdf_bytes") or raw_pdf
 
     # ── Split mode selector ────────────────────────────────────────────────
     split_mode = st.radio(
@@ -428,7 +1153,7 @@ def render_pdf_upload(on_back):
                 page_to_doc[p] = doc.get("awb_number") or "—"
 
         # Re-extract raw page texts (cached in session state to avoid re-running)
-        if "debug_page_texts" not in st.session_state or st.session_state.get("debug_pdf_name") != uploaded.name:
+        if "debug_page_texts" not in st.session_state or st.session_state.get("debug_pdf_name") != current_source_name:
             import io as _io
             try:
                 import pdfplumber as _pdfplumber
@@ -437,7 +1162,7 @@ def render_pdf_upload(on_back):
                     for i, _page in enumerate(_pdf.pages):
                         raw_page_texts[i + 1] = _page.extract_text() or "(no native text — scanned page)"
                 st.session_state["debug_page_texts"] = raw_page_texts
-                st.session_state["debug_pdf_name"] = uploaded.name
+                st.session_state["debug_pdf_name"] = current_source_name
             except Exception as _e:
                 st.warning(f"Could not extract raw text: {_e}")
                 raw_page_texts = {}
@@ -470,8 +1195,8 @@ def render_pdf_upload(on_back):
     # ── Preview rendered PNGs (rotation-corrected, no Claude call) ─────────
     with st.expander("🖼 Preview rendered pages (rotation check — no Claude call)", expanded=False):
         st.caption(
-            "Downloads a ZIP of the PNG images that would be sent to Claude Vision. "
-            "Use this to verify orientation correction before spending API credits."
+            "Downloads a ZIP of the PNG images that would be sent to the selected provider. "
+            "Use this to verify orientation correction before processing."
         )
         if st.button("📦 Build PNG preview ZIP", key="build_png_zip"):
             import io as _zip_io
@@ -549,7 +1274,7 @@ def render_pdf_upload(on_back):
             st.download_button(
                 label=f"⬇️ Download {total_pages} PNG(s) as ZIP",
                 data=buf.getvalue(),
-                file_name=f"{uploaded.name.rsplit('.', 1)[0]}_preview.zip",
+                file_name=f"{current_source_name.rsplit('.', 1)[0]}_preview.zip",
                 mime="application/zip",
                 key="download_png_zip",
             )
@@ -558,8 +1283,13 @@ def render_pdf_upload(on_back):
     # ── Extract All ────────────────────────────────────────────────────────
     col_extract, col_reset = st.columns([2, 1])
     with col_extract:
+        provider_labels = {
+            "claude": "Claude Vision",
+            "msc_tech_ai": "MSC Tech AI"
+        }
+        provider_label = provider_labels.get(provider_name, "Unknown")
         extract_btn = st.button(
-            f"🚀 Extract all ({len(split_docs)}) with Claude Vision",
+            f"🚀 Extract all ({len(split_docs)}) with {provider_label}",
             type="primary",
             width='stretch',
         )
@@ -569,8 +1299,32 @@ def render_pdf_upload(on_back):
             st.session_state["vision_refined_awbs"] = {}
             st.rerun()
 
+    invalid_msc_path = False
+    msc_png_folder = st.session_state.get("msc_png_folder", "") if provider_name == "msc_tech_ai" else None
+    msc_json_folder = st.session_state.get("msc_json_folder", "") if provider_name == "msc_tech_ai" else None
+    if provider_name == "msc_tech_ai":
+        for label, path in (
+            ("PNG inbox folder", msc_png_folder),
+            ("JSON output folder", msc_json_folder),
+        ):
+            if path:
+                lower_path = path.lower()
+                if lower_path.startswith("http://") or lower_path.startswith("https://") or lower_path.startswith("http:\\") or lower_path.startswith("https:\\"):
+                    st.info(f"{label} looks like a browser URL. The app will resolve it to a local OneDrive sync path.")
+                elif not Path(path).exists():
+                    st.warning(f"{label} does not exist locally. Enter a valid local path or a browser URL.")
+                    invalid_msc_path = True
+
     if extract_btn:
-        extractor = get_claude_vision()
+        if invalid_msc_path:
+            st.warning("Fix the MSC Tech AI folder paths before extracting.")
+        else:
+            extractor = get_vision_extractor(
+                provider_name=provider_name,
+                png_folder=msc_png_folder,
+                json_folder=msc_json_folder,
+                group_label=st.session_state.get("msc_group_label") if provider_name == "msc_tech_ai" else None,
+            )
         extracted: list[dict] = []  # each item: {"mawb": {...}, "hawbs": [...]}
         progress = st.progress(0, text="Starting...")
         errors: list[str] = []
@@ -584,6 +1338,8 @@ def render_pdf_upload(on_back):
                     start_page=doc.get("start_page", 1),
                     end_page=doc.get("end_page", doc.get("start_page", 1)),
                     page_rotations=doc.get("page_rotations"),
+                    awb_number=doc.get("awb_number"),
+                    group_label=st.session_state.get("msc_group_label", "") if provider_name == "msc_tech_ai" else None,
                 )
                 # Trust pre-validated AWB number from the splitter
                 if doc.get("awb_number"):
@@ -608,23 +1364,71 @@ def render_pdf_upload(on_back):
         return
 
     results: list[dict] = st.session_state["awb_results"]
+
+    if polling_mode and st.session_state.get("polling_current_path"):
+        col_poll_action, col_next = st.columns([2, 1])
+        with col_poll_action:
+            if st.button("🧾 iCargo update (simulate writeback)", type="primary"):
+                current_path = st.session_state.get("polling_current_path")
+                if current_path:
+                    moved = _move_polling_file_to_processed(current_path, polling_processed_dir)
+                    st.success(
+                        f"✅ File moved to processed folder: {moved.name}\n"
+                        "The polling queue is now ready for the next PDF."
+                    )
+                    st.session_state["polling_current_path"] = None
+                    st.session_state["split_documents"] = None
+                    st.session_state["awb_results"] = None
+                    st.session_state["vision_refined_awbs"] = {}
+                    st.session_state["debug_page_texts"] = None
+                    st.session_state["debug_pdf_name"] = None
+                    st.rerun()
+        with col_next:
+            if st.button("➡️ Next polling file", type="secondary"):
+                st.session_state["polling_current_path"] = None
+                st.session_state["split_documents"] = None
+                st.session_state["awb_results"] = None
+                st.session_state["vision_refined_awbs"] = {}
+                st.session_state["debug_page_texts"] = None
+                st.session_state["debug_pdf_name"] = None
+                st.rerun()
     st.divider()
     total_hawbs_all = sum(len(r.get("hawbs", [])) for r in results)
     st.subheader(f"Results — {len(results)} MAWB, {total_hawbs_all} HAWB")
 
     for idx, result in enumerate(results):
-        mawb_data = result.get("mawb", result)  # fallback: result itself is flat
-        hawbs: list[dict] = result.get("hawbs", [])
+        raw_mawb = result.get("mawb") if isinstance(result.get("mawb"), dict) else {}
+        raw_hawbs = result.get("hawbs") if isinstance(result.get("hawbs"), list) else []
+        mawb_data = raw_mawb or {}
+        hawbs: list[dict] = raw_hawbs
         awb_num = mawb_data.get("awb_number") or f"AWB_{idx+1}"
         refined = st.session_state["vision_refined_awbs"].get(awb_num)
         display_mawb = refined.get("mawb", refined) if refined else mawb_data
         display_hawbs = refined.get("hawbs", hawbs) if refined else hawbs
+        if not isinstance(display_mawb, dict):
+            display_mawb = {}
+        if not isinstance(display_hawbs, list):
+            display_hawbs = []
 
         hawb_badge = f" • {len(display_hawbs)} HAWB" if display_hawbs else ""
         pdf_badge = f"  [{result.get('_pdf_name')}]" if is_zip and result.get("_pdf_name") else ""
         with st.expander(f"📦 MAWB {awb_num}{hawb_badge}{pdf_badge}", expanded=(idx == 0)):
-            source_label = "🔮 Claude Vision (re-extracted)" if refined else "🔮 Claude Vision"
+            provider_labels = {
+                "claude": "Claude Vision",
+                "msc_tech_ai": "MSC Tech AI"
+            }
+            provider_label = provider_labels.get(provider_name, "Unknown")
+            source_label = f"🔮 {provider_label} (re-extracted)" if refined else f"🔮 {provider_label}"
             st.success(source_label)
+
+            result_payload = refined if isinstance(refined, dict) else result
+            assignment_mode = (result_payload or {}).get("hawb_assignment_mode")
+            warnings = (result_payload or {}).get("warnings") or []
+            if assignment_mode == "group_fallback":
+                st.warning("MAWB number not found in the HAWB doc; using group assignment fallback.")
+            for msg in warnings:
+                if isinstance(msg, str) and msg.strip():
+                    st.warning(msg)
 
             # ── MAWB fields ──────────────────────────────────────────────
             st.markdown("#### 📋 Master Air Waybill")
@@ -647,7 +1451,12 @@ def render_pdf_upload(on_back):
             if st.button("🔄 Re-extract with Vision (MAWB + HAWB)", key=f"reextract_{idx}", type="secondary"):
                 try:
                     with st.spinner(f"Re-extracting {awb_num}..."):
-                        ext = get_claude_vision()
+                        ext = get_vision_extractor(
+                            provider_name=provider_name,
+                            png_folder=msc_png_folder,
+                            json_folder=msc_json_folder,
+                            group_label=st.session_state.get("msc_group_label") if provider_name == "msc_tech_ai" else None,
+                        )
                         doc = next((d for d in split_docs if (d.get("awb_number") or "") == awb_num), None)
                         doc_pdf_bytes = doc.get("_pdf_bytes") if doc else None
                         if doc and doc_pdf_bytes:
@@ -656,6 +1465,8 @@ def render_pdf_upload(on_back):
                                 start_page=doc.get("start_page", 1),
                                 end_page=doc.get("end_page", doc.get("start_page", 1)),
                                 page_rotations=doc.get("page_rotations"),
+                                awb_number=doc.get("awb_number"),
+                                group_label=st.session_state.get("msc_group_label", "") if provider_name == "msc_tech_ai" else None,
                             )
                         else:
                             text = (doc or {}).get("text", "") if doc else ""
@@ -683,127 +1494,389 @@ def render_pdf_upload(on_back):
 
             # iCargo comparison (MAWB + HAWBs)
             st.markdown("**📊 Compare with iCargo (MAWB + HAWBs)**")
-            if st.button("Fetch & Compare iCargo", key=f"icargo_{idx}", type="primary"):
-                if awb_num and "-" in awb_num:
+            awb_for_icargo = _resolve_awb_for_icargo(str(awb_num), display_mawb)
+            compare_state_key = f"{idx}:{awb_for_icargo}"
+            fetch_compare = st.button("Fetch & Compare iCargo", key=f"icargo_{idx}", type="primary")
+
+            if fetch_compare:
+                if not awb_for_icargo:
+                    st.warning(
+                        "Invalid AWB number for iCargo query. "
+                        f"Detected value: {awb_num}. Expected format: NNN-NNNNNNNN"
+                    )
+                else:
                     try:
                         ic = ICargoIBSClient()
 
-                        # ── MAWB comparison ──────────────────────────────────
-                        with st.spinner(f"Fetching MAWB {awb_num} from iCargo..."):
-                            icargo_result = ic.get_awb(awb_num)
+                        with st.spinner(f"Fetching MAWB {awb_for_icargo} from iCargo..."):
+                            icargo_result = ic.get_awb(awb_for_icargo)
                         icargo_flat = map_icargo_awb_ibs(icargo_result)
-                        rows = diff_awb(display_mawb, icargo_flat)
-                        st.markdown("##### MAWB")
-                        st.dataframe(rows, width='stretch')
-                        mawb_mismatches = [r for r in rows if not r["match"]]
-                        if not mawb_mismatches:
-                            st.success("✅ MAWB — no differences!")
-                        else:
-                            st.warning(f"⚠️ MAWB — {len(mawb_mismatches)} difference(s)")
+                        mawb_rows = diff_awb(display_mawb, icargo_flat)
 
-                        # ── HAWB comparison ──────────────────────────────────
-                        if display_hawbs:
-                            st.markdown("##### HAWBs")
-                            hawbs_resp = None
-                            with st.spinner(f"Fetching HAWBs for {awb_num} from iCargo..."):
-                                try:
-                                    hawbs_resp = ic.get_hawbs(awb_num)
-                                except Exception as he:
-                                    st.warning(f"⚠️ Could not fetch HAWBs from iCargo: {he}")
+                        hawb_compare_records: list[dict] = []
+                        match_debug_rows: list[dict] = []
+                        ic_hawb_list: list = []
+                        hawbs_resp = None
 
-                            if hawbs_resp is not None:
-                                # ── Normalise response to a flat list ─────────────────
-                                def _flatten_hawbs_resp(resp) -> list:
-                                    if isinstance(resp, list):
-                                        return resp
-                                    if not isinstance(resp, dict):
-                                        return []
-                                    # Try common top-level keys
-                                    for key in ("hawbs", "body", "data", "items", "result", "results"):
-                                        val = resp.get(key)
-                                        if isinstance(val, list) and val:
-                                            return val
-                                        if isinstance(val, dict):
-                                            # one more level: e.g. {"body": {"hawbs": [...]}}
-                                            inner = _flatten_hawbs_resp(val)
-                                            if inner:
-                                                return inner
-                                    return []
+                        with st.spinner(f"Fetching HAWBs for {awb_for_icargo} from iCargo..."):
+                            try:
+                                hawbs_resp = ic.get_hawbs(awb_for_icargo)
+                            except Exception as he:
+                                st.warning(f"⚠️ Could not fetch HAWBs from iCargo: {he}")
 
-                                ic_hawb_list = _flatten_hawbs_resp(hawbs_resp)
+                        def _flatten_hawbs_resp(resp) -> list:
+                            if isinstance(resp, list):
+                                return resp
+                            if not isinstance(resp, dict):
+                                return []
+                            for key in ("hawbs", "body", "data", "items", "result", "results"):
+                                val = resp.get(key)
+                                if isinstance(val, list) and val:
+                                    return val
+                                if isinstance(val, dict):
+                                    inner = _flatten_hawbs_resp(val)
+                                    if inner:
+                                        return inner
+                            return []
 
-                                # ── Raw iCargo debug info ──────────────────────────────
-                                with st.expander(
-                                    f"🔎 iCargo response — {len(ic_hawb_list)} HAWB(s) ricevuti",
-                                    expanded=False,
-                                ):
-                                    st.json(hawbs_resp)
+                        ic_hawb_list = _flatten_hawbs_resp(hawbs_resp)
 
-                                def _ic_num(h: dict) -> str:
-                                    return str(
-                                        h.get("hawb")
-                                        or h.get("hawb_number")
-                                        or h.get("hawbNumber")
-                                        or h.get("houseAirwaybillNumber")
-                                        or h.get("hawbNo")
-                                        or ""
-                                    ).strip()
+                        def _ic_num(h: dict) -> str:
+                            return str(
+                                h.get("hawb")
+                                or h.get("hawb_number")
+                                or h.get("hawbNumber")
+                                or h.get("houseAirwaybillNumber")
+                                or h.get("hawbNo")
+                                or ""
+                            ).strip()
 
-                                def _norm_hawb_key(n: str) -> str:
-                                    return re.sub(r"[\s\-]", "", n).lstrip("0").upper()
+                        def _norm_hawb_key(n: str) -> str:
+                            return re.sub(r"[^A-Z0-9]", "", (n or "").upper())
 
-                                # Build lookup: normalised_key → (original_num, iCargo record)
-                                ic_by_norm: dict[str, tuple[str, dict]] = {}
-                                for h in ic_hawb_list:
-                                    if isinstance(h, dict):
-                                        raw = _ic_num(h)
-                                        if raw:
-                                            ic_by_norm[_norm_hawb_key(raw)] = (raw, h)
+                        def _digits_only(n: str) -> str:
+                            return "".join(ch for ch in (n or "") if ch.isdigit())
 
-                                pdf_nums_seen: set[str] = set()  # tracks normalised keys
+                        def _middle_slice(s: str, size: int) -> str:
+                            if len(s) <= size:
+                                return s
+                            start = max(0, (len(s) - size) // 2)
+                            return s[start:start + size]
 
-                                # ── PDF HAWBs: matched or PDF-only orphan ──────────────
-                                for hi, hawb in enumerate(display_hawbs):
-                                    hawb_num_key = hawb.get("hawb_number") or f"HAWB_{hi + 1}"
-                                    norm_key = _norm_hawb_key(hawb_num_key)
-                                    pdf_nums_seen.add(norm_key)
+                        def _hawb_variants(n: str) -> list[str]:
+                            norm = _norm_hawb_key(n)
+                            digits = _digits_only(norm)
+                            out: list[str] = []
 
-                                    ic_entry = ic_by_norm.get(norm_key)
-                                    ic_hawb = ic_entry[1] if ic_entry else None
-                                    ic_label = ic_entry[0] if ic_entry else None
+                            def _add(v: str):
+                                if v and v not in out:
+                                    out.append(v)
 
-                                    if ic_hawb is not None:
-                                        label_suffix = (
-                                            f" ↔ iCargo {ic_label}" if ic_label and ic_label != hawb_num_key else ""
-                                        )
-                                        ic_hawb_flat = map_icargo_hawb_ibs(ic_hawb)
-                                        hawb_rows = diff_hawb(hawb, ic_hawb_flat)
-                                        st.markdown(f"###### {hawb_num_key}{label_suffix}")
-                                        st.dataframe(hawb_rows, width='stretch')
-                                        hawb_mismatches = [r for r in hawb_rows if not r["match"]]
-                                        if not hawb_mismatches:
-                                            st.success(f"✅ {hawb_num_key} — no differences!")
-                                        else:
-                                            st.warning(f"⚠️ {hawb_num_key} — {len(hawb_mismatches)} difference(s)")
-                                    else:
-                                        # Orphan: in PDF, not found in iCargo
-                                        st.markdown(f"###### 🔍 {hawb_num_key} — solo PDF")
-                                        ic_hawb_flat = map_icargo_hawb_ibs({})
-                                        hawb_rows = diff_hawb(hawb, ic_hawb_flat)
-                                        st.dataframe(hawb_rows, width='stretch')
+                            _add(norm)
+                            _add(_middle_slice(norm, 8))
+                            _add(_middle_slice(norm, 6))
+                            if len(digits) >= 8:
+                                _add(digits[-8:])
+                            if len(digits) >= 6:
+                                _add(digits[-6:])
+                            _add(_middle_slice(digits, 8))
+                            _add(_middle_slice(digits, 6))
+                            return out
 
-                                # ── iCargo HAWBs not matched to any PDF HAWB ──────────
-                                for norm_k, (ic_num, ic_hawb) in ic_by_norm.items():
-                                    if norm_k not in pdf_nums_seen:
-                                        st.markdown(f"###### 🔍 {ic_num} — solo iCargo")
-                                        ic_hawb_flat = map_icargo_hawb_ibs(ic_hawb)
-                                        hawb_rows = diff_hawb({}, ic_hawb_flat)
-                                        st.dataframe(hawb_rows, width='stretch')
+                        def _primary_hawb_key(n: str) -> str:
+                            digits = _digits_only(n)
+                            if len(digits) >= 8:
+                                return digits[-8:]
+                            norm = _norm_hawb_key(n)
+                            if len(norm) >= 8:
+                                return norm[-8:]
+                            return norm
 
+                        pdf_hawbs_unique: list[tuple[str, dict]] = []
+                        pdf_seen_keys: set[str] = set()
+                        for hi, hawb in enumerate(display_hawbs):
+                            hawb_num_key = (hawb.get("hawb_number") or f"HAWB_{hi + 1}").strip()
+                            pkey = _primary_hawb_key(hawb_num_key)
+                            dedupe_key = pkey or _norm_hawb_key(hawb_num_key)
+                            if dedupe_key and dedupe_key in pdf_seen_keys:
+                                continue
+                            if dedupe_key:
+                                pdf_seen_keys.add(dedupe_key)
+                            pdf_hawbs_unique.append((hawb_num_key, hawb))
+
+                        ic_entries: list[dict] = []
+                        ic_variant_index: dict[str, list[int]] = {}
+                        for h in ic_hawb_list:
+                            if not isinstance(h, dict):
+                                continue
+                            raw = _ic_num(h)
+                            if not raw:
+                                continue
+                            idx_ic = len(ic_entries)
+                            ic_entries.append({
+                                "raw": raw,
+                                "record": h,
+                                "variants": _hawb_variants(raw),
+                            })
+                            for variant in ic_entries[idx_ic]["variants"]:
+                                ic_variant_index.setdefault(variant, []).append(idx_ic)
+
+                        matched_ic_idx: set[int] = set()
+
+                        def _match_score(pdf_num: str, ic_num: str) -> int:
+                            pdf_norm = _norm_hawb_key(pdf_num)
+                            ic_norm = _norm_hawb_key(ic_num)
+                            if not pdf_norm or not ic_norm:
+                                return 0
+                            if pdf_norm == ic_norm:
+                                return 100
+                            pdf_digits = _digits_only(pdf_norm)
+                            ic_digits = _digits_only(ic_norm)
+                            if len(pdf_digits) >= 8 and len(ic_digits) >= 8 and pdf_digits[-8:] == ic_digits[-8:]:
+                                return 95
+                            if len(pdf_digits) >= 6 and len(ic_digits) >= 6 and pdf_digits[-6:] == ic_digits[-6:]:
+                                return 85
+                            return 0
+
+                        for hawb_num_key, hawb in pdf_hawbs_unique:
+                            pdf_vars = _hawb_variants(hawb_num_key)
+                            candidate_idxs: set[int] = set()
+                            for variant in pdf_vars:
+                                for idx_ic in ic_variant_index.get(variant, []):
+                                    if idx_ic not in matched_ic_idx:
+                                        candidate_idxs.add(idx_ic)
+
+                            best_idx = None
+                            best_score = 0
+                            for idx_ic in candidate_idxs:
+                                score = _match_score(hawb_num_key, ic_entries[idx_ic]["raw"])
+                                if score > best_score:
+                                    best_score = score
+                                    best_idx = idx_ic
+
+                            if best_idx is None:
+                                for idx_ic, entry in enumerate(ic_entries):
+                                    if idx_ic in matched_ic_idx:
+                                        continue
+                                    score = _match_score(hawb_num_key, entry["raw"])
+                                    if score > best_score:
+                                        best_score = score
+                                        best_idx = idx_ic
+
+                            if best_idx is not None and best_score >= 70:
+                                matched_ic_idx.add(best_idx)
+                                ic_label = ic_entries[best_idx]["raw"]
+                                ic_hawb = ic_entries[best_idx]["record"]
+                                ic_hawb_mapped = map_icargo_hawb_ibs(ic_hawb)
+                                rows_h = diff_hawb(hawb, ic_hawb_mapped)
+                                hawb_compare_records.append({
+                                    "status": "matched",
+                                    "pdf_hawb": hawb_num_key,
+                                    "icargo_hawb": ic_label,
+                                    "score": best_score,
+                                    "rows": rows_h,
+                                    "pdf_hawb_data": hawb,
+                                    "icargo_hawb_data": ic_hawb,
+                                    "icargo_hawb_mapped": ic_hawb_mapped,
+                                })
+                                match_debug_rows.append({"status": "matched", "pdf_hawb": hawb_num_key, "icargo_hawb": ic_label, "score": best_score})
+                            else:
+                                rows_h = diff_hawb(hawb, map_icargo_hawb_ibs({}))
+                                hawb_compare_records.append({
+                                    "status": "pdf_only",
+                                    "pdf_hawb": hawb_num_key,
+                                    "icargo_hawb": "",
+                                    "score": best_score,
+                                    "rows": rows_h,
+                                    "pdf_hawb_data": hawb,
+                                        "icargo_hawb_data": {},
+                                        "icargo_hawb_mapped": {},
+                                })
+                                match_debug_rows.append({"status": "pdf_only", "pdf_hawb": hawb_num_key, "icargo_hawb": "", "score": best_score})
+
+                        for idx_ic, entry in enumerate(ic_entries):
+                            if idx_ic not in matched_ic_idx:
+                                ic_hawb_mapped = map_icargo_hawb_ibs(entry["record"])
+                                rows_h = diff_hawb({}, ic_hawb_mapped)
+                                hawb_compare_records.append({
+                                    "status": "icargo_only",
+                                    "pdf_hawb": "",
+                                    "icargo_hawb": entry["raw"],
+                                    "score": 0,
+                                    "rows": rows_h,
+                                    "pdf_hawb_data": {},
+                                    "icargo_hawb_data": entry["record"],
+                                    "icargo_hawb_mapped": ic_hawb_mapped,
+                                })
+                                match_debug_rows.append({"status": "icargo_only", "pdf_hawb": "", "icargo_hawb": entry["raw"], "score": 0})
+
+                        st.session_state["icargo_compare_cache"][compare_state_key] = {
+                            "awb": awb_for_icargo,
+                            "icargo_awb_raw": icargo_result,
+                            "mawb_rows": mawb_rows,
+                            "hawb_records": hawb_compare_records,
+                            "match_debug_rows": match_debug_rows,
+                            "hawbs_resp": hawbs_resp,
+                        }
                     except Exception as e:
                         st.error(f"iCargo error: {e}")
+
+            compare_data = st.session_state.get("icargo_compare_cache", {}).get(compare_state_key)
+            if compare_data:
+                editor_column_config = {
+                    "field": st.column_config.TextColumn("field", disabled=True),
+                    "pdf_llm": st.column_config.TextColumn("pdf_llm"),
+                    "icargo": st.column_config.TextColumn("icargo", disabled=True),
+                    "match": st.column_config.CheckboxColumn("match", disabled=True),
+                    "apply": st.column_config.CheckboxColumn("apply"),
+                }
+                st.caption(f"Write target: {os.getenv('ICARGO_BASE_URL') or 'https://mac-stag-icargo.ibsplc.aero'}")
+                st.markdown("##### MAWB")
+                mawb_rows_augmented = _augment_rows_with_post_fields(
+                    compare_data.get("mawb_rows", []),
+                    display_mawb,
+                    MAWB_POST_EDITABLE_FIELDS,
+                )
+                mawb_editor_rows = _editor_rows_with_apply(mawb_rows_augmented)
+                edited_mawb = st.data_editor(
+                    mawb_editor_rows,
+                    width='stretch',
+                    hide_index=True,
+                    disabled=["field", "icargo", "match"],
+                    column_config=editor_column_config,
+                    key=f"mawb_editor_{compare_state_key}",
+                )
+                mawb_mismatches = [r for r in compare_data.get("mawb_rows", []) if not r.get("match")]
+                if not mawb_mismatches:
+                    st.success("✅ MAWB — no differences!")
                 else:
-                    st.warning("Invalid AWB number for iCargo query")
+                    st.warning(f"⚠️ MAWB — {len(mawb_mismatches)} difference(s)")
+
+                hawb_payload_candidates: list[dict] = []
+                if compare_data.get("hawb_records"):
+                    st.markdown("##### HAWBs")
+                    hawbs_resp = compare_data.get("hawbs_resp")
+                    if hawbs_resp is not None:
+                        with st.expander("🔎 iCargo raw HAWB response", expanded=False):
+                            st.json(hawbs_resp)
+
+                    for hi, rec in enumerate(compare_data.get("hawb_records", [])):
+                        status = rec.get("status")
+                        label = rec.get("pdf_hawb") or rec.get("icargo_hawb") or f"HAWB_{hi+1}"
+                        suffix = f" ↔ iCargo {rec.get('icargo_hawb')}" if rec.get("icargo_hawb") else ""
+                        if status == "pdf_only":
+                            st.markdown(f"###### 🔍 {label} — solo PDF")
+                        elif status == "icargo_only":
+                            st.markdown(f"###### 🔍 {label} — solo iCargo (editabile)")
+                        else:
+                            st.markdown(f"###### {label}{suffix}")
+
+                        hawb_source_data = rec.get("pdf_hawb_data") or rec.get("icargo_hawb_mapped") or {}
+
+                        seeded_rows: list[dict] = []
+                        for row in rec.get("rows", []):
+                            row_copy = dict(row)
+                            field_name = str(row_copy.get("field") or "").strip()
+                            if row_copy.get("pdf_llm") in (None, "", "—") and field_name:
+                                row_copy["pdf_llm"] = _to_editor_cell(hawb_source_data.get(field_name))
+                            seeded_rows.append(row_copy)
+
+                        hawb_rows_augmented = _augment_rows_with_post_fields(
+                            seeded_rows,
+                            hawb_source_data,
+                            HAWB_POST_EDITABLE_FIELDS,
+                        )
+                        editor_rows = _editor_rows_with_apply(
+                            hawb_rows_augmented,
+                            default_apply_mismatch=(status != "icargo_only"),
+                        )
+                        edited_hawb = st.data_editor(
+                            editor_rows,
+                            width='stretch',
+                            hide_index=True,
+                            disabled=["field", "icargo", "match"],
+                            column_config=editor_column_config,
+                            key=f"hawb_editor_{compare_state_key}_{hi}",
+                        )
+
+                        hawb_edited_rows = _to_records(edited_hawb)
+                        selected_fields = _selected_fields_from_rows(hawb_edited_rows)
+                        edited_values = _edited_pdf_values_from_rows(hawb_edited_rows)
+                        if selected_fields:
+                            hawb_payload_source = (
+                                rec.get("pdf_hawb_data")
+                                or rec.get("icargo_hawb_mapped")
+                                or ({"hawb_number": rec.get("icargo_hawb")} if rec.get("icargo_hawb") else {})
+                            )
+                            hawb_payload_candidates.append({
+                                "hawb_data": hawb_payload_source,
+                                "selected_fields": selected_fields,
+                                "edited_values": edited_values,
+                            })
+
+                with st.expander("🧪 HAWB diagnostic panel", expanded=False):
+                    st.dataframe(compare_data.get("match_debug_rows", []), width='stretch')
+
+                mawb_edited_rows = _to_records(edited_mawb)
+                selected_mawb_fields = _selected_fields_from_rows(mawb_edited_rows)
+                selected_mawb_edited_values = _edited_pdf_values_from_rows(mawb_edited_rows)
+
+                col_m, col_h, col_all = st.columns(3)
+                with col_m:
+                    update_master_btn = st.button("📝 Aggiorna Master", key=f"upd_master_{compare_state_key}")
+                with col_h:
+                    update_house_btn = st.button("🏠 Aggiorna House", key=f"upd_house_{compare_state_key}")
+                with col_all:
+                    update_all_btn = st.button("🚀 Aggiorna Tutto", key=f"upd_all_{compare_state_key}", type="primary")
+
+                def _do_update_master() -> bool:
+                    if not selected_mawb_fields:
+                        st.warning("Seleziona almeno un campo MAWB da aggiornare.")
+                        return False
+                    ic = ICargoIBSClient()
+                    payload = _build_awb_update_payload(
+                        compare_data.get("icargo_awb_raw") or {},
+                        display_mawb,
+                        selected_mawb_fields,
+                        selected_mawb_edited_values,
+                        awb_for_icargo,
+                    )
+                    msg = ic.save_awb(awb_for_icargo, payload)
+                    st.success(f"✅ Master aggiornata: {msg}")
+                    return True
+
+                def _do_update_house() -> bool:
+                    if not hawb_payload_candidates:
+                        st.warning("Seleziona almeno un campo HAWB da aggiornare.")
+                        return False
+                    payload_list: list[dict] = []
+                    for item in hawb_payload_candidates:
+                        hawb_payload = _build_hawb_detail_payload(
+                            awb_for_icargo,
+                            item["hawb_data"],
+                            item["selected_fields"],
+                            item.get("edited_values") or {},
+                        )
+                        if hawb_payload.get("hawb"):
+                            payload_list.append(hawb_payload)
+                    if not payload_list:
+                        st.warning("Nessuna HAWB valida da inviare.")
+                        return False
+                    ic = ICargoIBSClient()
+                    msg = ic.save_hawbs(awb_for_icargo, payload_list)
+                    st.success(f"✅ House aggiornate: {msg}")
+                    return True
+
+                try:
+                    if update_master_btn:
+                        _do_update_master()
+                    if update_house_btn:
+                        _do_update_house()
+                    if update_all_btn:
+                        if _do_update_master():
+                            _do_update_house()
+                except Exception as e:
+                    st.error(f"iCargo update error: {e}")
     # ── Batch download ─────────────────────────────────────────────────────
     st.divider()
     st.subheader("📥 Batch download")

@@ -100,7 +100,6 @@ I am showing you images of one shipment package that contains:
   2. ZERO OR MORE House Air Waybills (HAWB) — subsequent images
 
 All images have been pre-rotated to portrait orientation for your convenience.
-HAWB forms are typically multi-column tables; the columns now run top-to-bottom in the image.
 
 Extract ALL fields and return ONLY a valid JSON object with this exact structure (no markdown, no code fences):
 {
@@ -174,10 +173,16 @@ IMPORTANT — TWO HAWB DOCUMENT FORMATS exist:
        Master AWB | HAWB N. | DEP | PCS | G.Weight | Shipper | Consignee | DEST | Nature of Goods (HTS)
      "G.Weight" = gross weight in kg  |  "PCS" = number of pieces  |  "DEP" = departure IATA airport  |  "DEST" = destination IATA airport
 
+Assignment confirmation rule:
+    - If the HAWB source explicitly contains a Master AWB value, extract it in `mawb_number_reference`.
+    - This field is used downstream to confirm HAWB-to-MAWB assignment.
+    - If no Master AWB is printed in the HAWB document/row, set `mawb_number_reference` to null.
+
 hawb_number          — House AWB number. Copy the COMPLETE value character-by-character.
                        CRITICAL: codes like "MIL20788320" must include ALL digits — do NOT drop the digit(s)
                        that appear between a letter prefix and the numeric sequence (e.g. write "MIL20788320",
                        NOT "MIL0788320"). If unsure, re-read the cell carefully before writing the value.
+mawb_number_reference — Master AWB number shown in the HAWB document/row (for example in "Master AWB" column); null if absent
 origin               — IATA 3-letter departure airport
 destination          — IATA 3-letter destination airport
 shipper              — shipper company name
@@ -450,6 +455,8 @@ class ClaudeVisionProvider:
         start_page: int = 0,
         end_page: int = 0,
         page_rotations: Optional[dict] = None,
+        awb_number: Optional[str] = None,
+        group_label: Optional[str] = None,
     ) -> str:
         """
         Send PDF page images to Claude Vision and return a raw JSON string
@@ -493,6 +500,8 @@ class ClaudeVisionProvider:
         end_page: int = 0,
         max_images: int = 20,
         page_rotations: Optional[dict] = None,
+        awb_number: Optional[str] = None,
+        group_label: Optional[str] = None,
     ) -> str:
         """
         Send all pages of a MAWB block (including any HAWB pages that follow)
@@ -549,7 +558,12 @@ class ClaudeVisionProvider:
 
         return self._call_api(content, max_tokens=16000)
 
-    def extract_from_text(self, ocr_text: str) -> str:
+    def extract_from_text(
+        self,
+        ocr_text: str,
+        awb_number: Optional[str] = None,
+        group_label: Optional[str] = None,
+    ) -> str:
         """
         Fallback: send raw OCR text (no image) to Claude for extraction.
         Useful when a PDF page image is unavailable (e.g. text-only splits).

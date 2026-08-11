@@ -242,12 +242,7 @@ Create a `.env` file in the project root:
 UI_MODE=streamlit  # Options: streamlit, api
 
 # LLM Configuration
-# Phi3 Local (no API key needed)
-OLLAMA_BASE_URL=http://localhost:11434
-
-# Cohere Cloud (requires API key)
-CO_API_KEY=your-cohere-api-key
-COHERE_API_KEY=your-cohere-api-key  # Alternative env var
+CLAUDE_API_KEY=your-claude-api-key  # For Claude Vision provider
 
 # iCargo IBS Integration
 ICARGO_BASE_URL=https://mac-stag-icargo.ibsplc.aero
@@ -651,11 +646,10 @@ Input Text (AWB document)
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `UI_MODE` | No | `streamlit` | UI type: `streamlit` or `api` |
-| `CO_API_KEY` | Conditional | - | Cohere API key (for Cohere LLM) |
+| `CLAUDE_API_KEY` | Yes | - | Claude API key (for Claude Vision provider) |
 | `ICARGO_BASE_URL` | Yes | - | iCargo IBS API base URL |
 | `ICARGO_USERNAME` | Yes | - | iCargo authentication username |
 | `ICARGO_PASSWORD` | Yes | - | iCargo authentication password |
-| `OLLAMA_BASE_URL` | No | `http://localhost:11434` | Ollama/Phi3 local API |
 | `TESSERACT_PATH` | No | - | Path to Tesseract executable (Windows) |
 
 ### OCR Configuration
@@ -700,20 +694,6 @@ pytest tests/unit/test_awb_diff_engine.py -v
 
 ---
 
-## LLM Provider Comparison
-
-| Aspect | Phi3 (Local) | Cohere (Cloud) |
-|--------|------------|----------------|
-| **Cost** | Free | Pay per API call |
-| **Privacy** | 100% local | Cloud-based |
-| **Speed** | Depends on hardware | Fast API response |
-| **Accuracy** | Good for AWB data | Excellent |
-| **Setup** | Requires Ollama | Requires API key |
-| **Offline** | Yes | No |
-| **Best For** | PoC, privacy-focused | Production, reliability |
-
----
-
 ## Troubleshooting
 
 ### Common Issues
@@ -727,11 +707,7 @@ pytest tests/unit/test_awb_diff_engine.py -v
 - Check network connectivity
 - Confirm iCargo IBS API is available
 
-#### 3. **LLM Provider Not Responding**
-- **Phi3**: Ensure Ollama is running (`ollama serve`)
-- **Cohere**: Verify API key and rate limits
-
-#### 4. **PDF Text Extraction Poor Quality**
+#### 3. **PDF Text Extraction Poor Quality**
 - Increase OCR DPI (slower but more accurate)
 - Try different OCR languages
 - Check PDF is not scanned image-only

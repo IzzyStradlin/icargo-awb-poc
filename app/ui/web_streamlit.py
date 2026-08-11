@@ -93,7 +93,7 @@ def render_landing():
 
     st.markdown("<div class='msc-kicker'>Select workflow</div>", unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns(3, gap="large")
+    col1, col2, col3, col4 = st.columns(4, gap="large")
 
     with col1:
         st.markdown(
@@ -128,6 +128,23 @@ def render_landing():
             """
             <div class="msc-panel">
                 <div class="msc-kicker">Workflow 03</div>
+                <h3>Polling folder</h3>
+                <p>Watch a shared folder, pick the next PDF automatically, process it, and move it to the processed area when the user confirms the update.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Open Polling Workflow", key="btn_polling", width='stretch'):
+            st.session_state["folder_polling"] = True
+            st.session_state["polling_input_dir"] = r"C:\TEMP\POC"
+            st.session_state["polling_processed_dir"] = r"C:\TEMP\POC\PROCESSED"
+            set_page("pdf_upload")
+
+    with col4:
+        st.markdown(
+            """
+            <div class="msc-panel">
+                <div class="msc-kicker">Workflow 04</div>
                 <h3>AWB Lookup</h3>
                 <p>Query iCargo IBS directly by AWB number and inspect the raw JSON response in real time.</p>
             </div>

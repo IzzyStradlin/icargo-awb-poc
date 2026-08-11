@@ -1,303 +1,273 @@
 ﻿# Architecture — iCargo AWB Intelligent Processor (PoC)
 
-> **Status:** Proof of Concept  
-> **Version:** 1.4.0  
-> **Owner:** MSC Air Cargo
+> Status: Proof of Concept
+> Version: 1.6.0
+> Owner: MSC Air Cargo
 
 ---
 
 ## 1. Purpose
 
-This application automates the extraction, validation, and comparison of **Air Waybill (AWB)** data received as PDF attachments or email files (`.eml`). It is designed to reduce manual data-entry effort for cargo operations staff by:
+This repository implements a document-intelligence workflow for Air Waybill (AWB) review and validation.
 
-1. Splitting multi-AWB PDFs into individual document boundaries.
-2. Extracting MAWB (Master Air Waybill) and HAWB (House Air Waybill) fields using Claude Vision (AI).
-3. Comparing the extracted data against the live **iCargo IBS** system to surface discrepancies.
+The current codebase focuses on:
+
+1. Ingesting PDF and email-based AWB documents.
+2. Splitting multi-AWB PDFs into logical document ranges before extraction.
+3. Extracting MAWB and HAWB fields with a vision-first AI pipeline.
+4. Comparing extracted data with the iCargo IBS system.
+5. Surfacing discrepancies through a Streamlit UI and a lightweight FastAPI endpoint layer.
 
 ---
 
-## 2. High-Level Architecture
+## 2. High-Level Runtime Architecture
 
-```
+```text
 ┌───────────────────────────────────────────────────────────────────────┐
-│                        User Interface Layer                           │
-│             Streamlit Web App  ·  FastAPI REST (optional)             │
-└────────────────────────────┬──────────────────────────────────────────┘
-                             │
-          ┌──────────────────┴──────────────────┐
-          │                                     │
-   ┌──────▼──────────┐                 ┌────────▼──────────┐
-   │  PDF Workflow   │                 │  Email Workflow   │
-   │  (pdf_upload)   │                 │  (email_upload)   │
-   └──────┬──────────┘                 └────────┬──────────┘
-          │                                     │
-          └──────────────────┬──────────────────┘
-                             │
-          ┌──────────────────▼──────────────────────────────┐
-          │              Pre-Splitting Layer                 │
-          │  AwbDocumentPreSplitter                         │
-          │  • pdfplumber native text extraction            │
-          │  • Tesseract OCR fallback (100–300 DPI)         │
-          │  • Fuzzy AWB boundary detection                 │
-          │  • Parallel fast mode / sequential normal mode  │
-          └──────────────────┬──────────────────────────────┘
-                             │  (page ranges per MAWB)
-          ┌──────────────────▼──────────────────────────────┐
-          │            AI Extraction Layer                   │
-          │  AwbVisionExtractor → ClaudeVisionProvider      │
-          │  • PDF pages rendered to PNG images             │
-          │  • Sent directly to Claude Haiku 4.5 Vision     │
-          │  • Returns structured JSON (MAWB + HAWBs)       │
-          └──────────────────┬──────────────────────────────┘
-                             │
-          ┌──────────────────▼──────────────────────────────┐
-          │           Validation & Comparison Layer          │
-          │  ICargoIBSClient  +  AwbDiffEngine              │
-          │  • Bearer-token auth against iCargo API         │
-          │  • Field-level diff (extracted vs iCargo)       │
-          │  • Tabular results displayed in the UI          │
-          └─────────────────────────────────────────────────┘
+│                         Presentation Layer                               │
+│  Streamlit Web App  •  FastAPI HTTP endpoints (optional)              │
+└───────────────────────────────┬───────────────────────────────────────┘
+                                │
+                    ┌───────────▼───────────┐
+                    │    Workflow Entry     │
+                    │ app/main.py           │
+                    │ UI_MODE=streamlit/api │
+                    └───────────┬───────────┘
+                                │
+        ┌───────────────────────┼───────────────────────┐
+        │                       │                       │
+┌───────▼────────┐   ┌──────────▼──────────┐   ┌────────▼──────────┐
+│ PDF workflow    │   │ Email workflow     │   │ AWB lookup        │
+│ pdf_upload.py   │   │ email_upload.py    │   │ awb_lookup.py     │
+└───────┬────────┘   └──────────┬──────────┘   └────────┬──────────┘
+        │                       │                       │
+        └────────────┬──────────┘                       │
+                     │                                  │
+        ┌────────────▼─────────────────────────────────────┐
+        │               Extraction & Interpretation          │
+        │  AwbDocumentPreSplitter → AwbVisionExtractor      │
+        │  PDFTextExtractor / OCR fallback                  │
+        └────────────┬─────────────────────────────────────┘
+                     │
+        ┌────────────▼─────────────────────────────────────┐
+        │             Integration & Comparison               │
+        │ ICargoIBSClient → AwbRepository / AwbDiffEngine   │
+        └────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 3. Directory Structure
+## 3. Current Code Architecture
 
-```
-icargo-awb-poc/
-├── app/
-│   ├── main.py                          # Entry point — dispatches Streamlit or FastAPI
-│   ├── common/
-│   │   ├── exceptions.py                # Custom exception hierarchy
-│   │   ├── logging.py                   # Structured logging setup
-│   │   └── utils.py                     # Shared utility functions
-│   ├── config/
-│   │   └── settings.py                  # Pydantic-based env-var configuration
-│   ├── extraction/
-│   │   ├── pdf_text_extractor.py        # pdfplumber + Tesseract per-page extractor
-│   │   ├── email_text_extractor.py      # HTML-to-text converter for email bodies
-│   │   ├── awb_document_presplitter.py  # Multi-AWB boundary detection engine
-│   │   └── awb_document_splitter.py     # Single-pass text splitter (FastAPI pipeline)
-│   ├── ingestion/
-│   │   ├── pdf_ingestor.py              # File-level PDF intake
-│   │   └── email_ingestor.py            # File-level .eml intake
-│   ├── interpretation/
-│   │   ├── awb_vision_extractor.py      # Main extractor (Claude Vision)
-│   │   ├── awb_field_detector.py        # Regex / heuristic field detector (FastAPI pipeline)
-│   │   ├── awb_schema.py                # Pydantic schema for AWB fields
-│   │   ├── awb_normalizer.py            # Field normalisation (dates, weights, codes)
-│   │   ├── awb_number.py                # AWB number parsing & validation helpers
-│   │   ├── awb_llm_parser.py            # JSON response cleaner / parser
-│   │   ├── awb_table_parser.py          # Table structure extractor (quantity / weight)
-│   │   ├── iata_awb_extraction_pipeline_v3.py  # v3 IATA-aligned pipeline
-│   │   ├── iata_awb_parsing_agent_v3.py         # v3 parsing agent
-│   │   └── iata_awb_label_extractor.py          # IATA label field extractor
-│   ├── llm/
-│   │   └── claude_vision_provider.py    # Anthropic API client (vision + text fallback)
-│   ├── compare/
-│   │   └── awb_diff_ibs.py              # Field normalisation + diff logic vs iCargo IBS
-│   ├── comparison/
-│   │   └── awb_diff_engine.py           # Typed diff engine (list of DiffItem)
-│   ├── integration/
-│   │   ├── awb_repository.py            # AWB CRUD abstraction over iCargo API
-│   │   └── icargo_ibs_client.py         # Low-level iCargo IBS HTTP client
-│   ├── pipelines/
-│   │   ├── run_from_pdf.py              # Headless PDF pipeline runner
-│   │   └── run_from_email.py            # Headless email pipeline runner
-│   └── ui/
-│       ├── web_streamlit.py             # Streamlit app shell & navigation router
-│       ├── web_fastapi.py               # FastAPI REST endpoints
-│       ├── assets/
-│       │   └── branding.py              # MSC brand colours, CSS, logo helpers
-│       └── pages/
-│           ├── pdf_upload.py            # PDF workflow page (split → extract → compare)
-│           └── email_upload.py          # Email workflow page (.eml intake)
-├── tests/
-│   └── unit/
-│       ├── test_awb_diff_engine.py
-│       ├── test_awb_field_detector.py
-│       └── test_multi_awb_extraction.py
-├── requirements.txt
-├── README.md
-└── ARCHITECTURE.md                      # This document
+### 3.1 Entry Point
+
+The launcher in [app/main.py](app/main.py) selects the UI runtime from the `UI_MODE` environment variable:
+
+- `streamlit` → launches the Streamlit shell
+- `api` → launches FastAPI through Uvicorn
+
+This makes the application a single repository with two front ends sharing the same core modules.
+
+### 3.2 User Interface Layer
+
+The current UI is built around Streamlit:
+
+- [app/ui/web_streamlit.py](app/ui/web_streamlit.py)
+  - app shell
+  - page routing
+  - branding and layout
+- [app/ui/pages/pdf_upload.py](app/ui/pages/pdf_upload.py)
+  - main PDF ingestion workflow
+  - AWB splitting and extraction
+  - comparative rendering of extracted vs iCargo fields
+- [app/ui/pages/email_upload.py](app/ui/pages/email_upload.py)
+  - email intake placeholder for `.eml` processing
+- [app/ui/pages/awb_lookup.py](app/ui/pages/awb_lookup.py)
+  - direct AWB lookup against the iCargo system
+
+The API surface is exposed by [app/ui/web_fastapi.py](app/ui/web_fastapi.py). It provides a small set of endpoints for PDF extraction and iCargo lookup.
+
+### 3.3 Ingestion Layer
+
+The ingestion layer is responsible for reading raw artefacts and handing them to the extraction pipeline.
+
+Relevant modules:
+
+- [app/ingestion/pdf_ingestor.py](app/ingestion/pdf_ingestor.py)
+- [app/ingestion/email_ingestor.py](app/ingestion/email_ingestor.py)
+
+The flow is intentionally file-first: the application receives a PDF or email blob, then converts it into an internal extraction-friendly representation.
+
+### 3.4 Extraction Layer
+
+This is the core intelligence layer.
+
+#### 3.4.1 PDF text and OCR extraction
+
+- [app/extraction/pdf_text_extractor.py](app/extraction/pdf_text_extractor.py)
+  - reads PDF content
+  - uses native PDF text extraction when possible
+  - falls back to OCR-oriented processing for ambiguous pages
+
+#### 3.4.2 Pre-splitting before extraction
+
+- [app/extraction/awb_document_presplitter.py](app/extraction/awb_document_presplitter.py)
+
+This module is the most important architectural feature of the current PoC. It splits a multi-document PDF into page ranges belonging to one logical MAWB block before the AI extraction stage starts.
+
+The strategy is based on:
+
+- fuzzy matching of AWB header markers
+- fallback to MAWB phrase markers
+- page clustering and document boundary detection
+
+This is intentionally designed to avoid OCR or model context bleeding between adjacent AWBs.
+
+#### 3.4.3 Vision extraction
+
+- [app/interpretation/awb_vision_extractor.py](app/interpretation/awb_vision_extractor.py)
+- [app/llm/claude_vision_provider.py](app/llm/claude_vision_provider.py)
+- [app/llm/msc_tech_ai_provider.py](app/llm/msc_tech_ai_provider.py)
+
+The current production path is driven by Claude Vision. The extractor:
+
+- renders PDF page ranges to images
+- sends them directly to the chosen provider
+- parses the returned structured JSON into the AWB schema
+
+The repository also supports an MSC Tech AI handoff provider, where the image work is written to a folder-based inbox/outbox instead of directly calling an API.
+
+### 3.5 Interpretation Layer
+
+These modules normalize and shape the extracted content into data structures:
+
+- [app/interpretation/awb_schema.py](app/interpretation/awb_schema.py)
+- [app/interpretation/awb_normalizer.py](app/interpretation/awb_normalizer.py)
+- [app/interpretation/awb_number.py](app/interpretation/awb_number.py)
+- [app/interpretation/awb_llm_parser.py](app/interpretation/awb_llm_parser.py)
+- [app/interpretation/awb_field_detector.py](app/interpretation/awb_field_detector.py)
+- [app/interpretation/awb_table_parser.py](app/interpretation/awb_table_parser.py)
+
+This layer provides the schema, numeric normalization, string cleanup, and field-detection logic used downstream by the comparison workflow.
+
+### 3.6 Comparison Layer
+
+The comparison flow is split between two modules:
+
+- [app/compare/awb_diff_ibs.py](app/compare/awb_diff_ibs.py)
+  - maps extracted data into a comparison-friendly structure
+  - computes field-level differences versus iCargo values
+- [app/comparison/awb_diff_engine.py](app/comparison/awb_diff_engine.py)
+  - typed diff engine used to produce structured comparison results
+
+This is where the PoC turns extraction output into operational discrepancies for review.
+
+### 3.7 Integration Layer
+
+The external system integration is centered on the iCargo HTTP client:
+
+- [app/integration/icargo_ibs_client.py](app/integration/icargo_ibs_client.py)
+- [app/integration/awb_repository.py](app/integration/awb_repository.py)
+
+Current responsibilities:
+
+- authenticate against the iCargo auth endpoint
+- retrieve AWB, booking, tracking, route, and HAWB-related records
+- hand off the returned payload to the comparison layer
+
+### 3.8 Pipeline Layer
+
+Headless runners are available for scripted or test execution:
+
+- [app/pipelines/run_from_pdf.py](app/pipelines/run_from_pdf.py)
+- [app/pipelines/run_from_email.py](app/pipelines/run_from_email.py)
+
+These pipelines are the repo’s batch-oriented entry points and generally mirror the same flow shown in the UI, but without the Streamlit interaction.
+
+---
+
+## 4. Main Processing Flow
+
+The current end-to-end PDF path is:
+
+1. User uploads a PDF through the Streamlit page.
+2. The app ingests the binary content.
+3. `AwbDocumentPreSplitter` groups pages into MAWB blocks.
+4. Each block is rendered and sent to the selected vision provider.
+5. The provider returns structured JSON with MAWB + HAWB fields.
+6. The result is normalized and compared with the iCargo record.
+7. The UI displays extracted data and diff outcomes.
+
+A simplified view:
+
+```text
+PDF upload
+  → PDFIngestor
+  → PDFTextExtractor / OCR preprocessing
+  → AwbDocumentPreSplitter
+  → AwbVisionExtractor
+  → ClaudeVisionProvider or MscTechAiProvider
+  → AwbNormalizer / AWB schema mapping
+  → ICargoIBSClient / AwbRepository
+  → AwbDiffEngine
+  → Streamlit diff rendering
 ```
 
 ---
 
-## 4. Component Details
+## 5. Runtime Configuration
 
-### 4.1 Entry Point — `app/main.py`
+The application relies on environment variables from `.env`.
 
-Reads the `UI_MODE` environment variable and launches either:
+Key configuration areas:
 
-| `UI_MODE`   | Runtime           | Port  |
-|-------------|-------------------|-------|
-| `streamlit` | Streamlit web app | 8501  |
-| `api`       | FastAPI + uvicorn | 8080  |
+- UI runtime selection
+  - `UI_MODE`
+- Anthropic / Claude
+  - `ANTHROPIC_API_KEY`
+  - `CLAUDE_MODEL`
+  - `CLAUDE_TIMEOUT`
+- iCargo connectivity
+  - `ICARGO_BASE_URL`
+  - `ICARGO_USERNAME`
+  - `ICARGO_PASSWORD`
+  - `ICARGO_TIMEOUT`
+- MSC Tech AI handoff
+  - `MSC_TECH_PNG_FOLDER`
+  - `MSC_TECH_JSON_FOLDER`
+  - `MSC_TECH_GROUP_LABEL`
 
----
-
-### 4.2 Pre-Splitting — `AwbDocumentPreSplitter`
-
-Multi-AWB PDFs (e.g. a batch of scanned MAWBs from an airline) are split into individual document page ranges **before** any AI extraction occurs. This prevents context bleeding between documents.
-
-**Strategy (in order of priority):**
-
-1. **Shipper boundary detection** — fuzzy match for `"Shipper's Name and Address"` (IATA Box 1), tolerance 0.72. Present on every standard AWB header.
-2. **Shipper account fallback** — fuzzy match for `"Shipper's Account Number"`, tolerance 0.75.
-3. **MAWB phrase markers** — `"Not Negotiable Air Waybill Issued by"` and variants, tolerance 0.85.
-4. **AWB number clustering** — extract all AWB numbers per page and cluster by 3-digit prefix.
-
-**Two OCR modes (boundary detection):**
-
-| Mode     | DPI  | Page area | Execution  | Use case                                              |
-|----------|------|-----------|------------|-------------------------------------------------------|
-| Smart    | 300  | Top 20 %  | Parallel   | Recommended — high AWB# accuracy on poor scans, fast |
-| Normal   | 200  | Full page | Sequential | Difficult/rotated scans, worst-case fallback          |
-
-> **Why 300 DPI / 20%?** On any IATA AWB form the AWB number and the "Shipper's Name and Address" label always appear in the top 12–15% of the page. A 20% crop adds a safe margin. 300 DPI is needed to reliably OCR small printed digits (e.g. `233-10166763`) on low-quality scans. Running in parallel on just the top slice keeps total wall-clock time well below the full-page sequential mode.
-
-**Orientation detection (Smart mode):**
-
-For every scanned page, a second Tesseract task runs `--psm 0` (OSD) on the full rendered image alongside the boundary-detection OCR. OSD detects the rotation (0°, 90°, 180°, or 270°) and stores the correction angle in `page_rotations` within the document dict. This feeds directly into the Claude Vision render step.
-
-**Cluster radii (boundary deduplication):**
-
-The fuzzy sliding-window scanner produces multiple consecutive hits for the same physical marker. Two cluster radii collapse these hits:
-
-| Cluster step | Radius | Rationale |
-|---|---|---|
-| Internal — inside `_find_shipper_name_markers` | **50 chars** | Sliding-window duplicates span at most `len(marker) − 1` = 24 chars; 50 is a safe collapse margin |
-| Merge — primary + secondary combined in `_presplit_by_shipper_marker` | **200 chars** | Large enough to unify "Shipper's Name" and "Shipper's Account" hits for the same AWB header (real separation ≤ ~150 chars in linearised 2-column OCR), small enough not to absorb a genuine second boundary when intermediate manifest pages produce sparse OCR output (~80 chars in the top-20% crop) |
-
-> **Known failure mode (fixed):** a merge radius of 500 caused the second MAWB in a `MAWB → Manifest → Manifest → MAWB` sequence to be silently dropped. Reducing to 200 resolves this.
+The settings abstraction is defined in [app/config/settings.py](app/config/settings.py), though the runtime still relies heavily on direct `os.getenv(...)` reads in the active modules.
 
 ---
 
-### 4.3 AI Extraction — `AwbVisionExtractor` + `ClaudeVisionProvider`
+## 6. Design Notes
 
-Each MAWB page range is converted to PNG images (via PyMuPDF/fitz) and sent to **Claude Haiku 4.5** (`claude-haiku-4-5-20251001`, overridable via `CLAUDE_MODEL` env var) through the Anthropic REST API.
+### Strengths of the current architecture
 
-**Key design decisions:**
-- No intermediate OCR text is sent to Claude — images are sent directly, preserving the 2-column IATA AWB layout that regex cannot reliably parse.
-- A structured JSON prompt instructs Claude to return exactly the AWB schema fields.
-- **Orientation correction** — before base64-encoding, `ClaudeVisionProvider._render_pages` applies `fitz.Matrix(1.5, 1.5).prerotate(correction)` per page, where `correction` (CCW degrees) comes from:
-1. `page_rotations[page]` (presplitter keyword-probe result) if present — highest priority.
-2. PDF content-stream text-direction (rawdict `dir` vectors) for digitally-generated PDFs.
-3. Pixel gradient score (row variance / column variance of dark pixels) comparing 0° and 90° — with carry-forward from the previous page when ambiguous.
+- clear separation between UI, extraction, normalization, comparison, and integration
+- document-oriented pre-splitting reduces contamination between AWBs
+- vision-first extraction is better aligned with real AWB layouts than pure text regex parsing
+- support for both Claude and MSC Tech AI providers keeps the execution path flexible
 
-PyMuPDF automatically applies the page's `/Rotate` entry before rendering, so correction angles are always relative to that already-normalised image.
+### Current limitations
 
-**Extracted MAWB fields:** `awb_number`, `origin`, `destination`, `shipper` (+ address parts), `consignee` (+ address parts), `agent` (+ address parts), `notify_party`, `pieces`, `weight`, `chargeable_weight`, `volume`, `dimensions`, `rate`, `total_charge`, `currency`, `goods_description`, `hs_code`, `special_handling`, `declared_value_carriage`, `declared_value_customs`, `flight_number`, `flight_date`.
-
-**Extracted HAWB fields:** same as MAWB plus `hawb_number`; AMS Manifest table rows are each extracted as a separate HAWB entry.
-
-**Flight number / date parsing:**
-Cargo AWB routing rows often encode flight and day-of-month together with a separator:
-
-| Notation | Example | Separator |
-|---|---|---|
-| `FLIGHT.DAY` | `CP139.7`, `CP139.07` | dot |
-| `FLIGHT/DAY` | `CP137/19`, `LH2054/03` | slash |
-| `FLIGHT_DAY` | `CP137_19` | underscore |
-| `FLIGHT DAY` | `LH2054 03` | space |
-
-Claude is instructed to:
-1. Split on the first occurrence of `.` `/` `_` or space between the alpha code and a 1-2 digit number.
-2. Use the left part as `flight_number` (e.g. `"CP137"`).
-3. Use the right part as the day-of-month and look for a reference month/year elsewhere in the same document (issue date, footer stamp) to reconstruct `flight_date` in `YYYY-MM-DD`.
-4. Return `null` for `flight_date` if no reference month/year is found.
-
-**Rotation detection cascade (`_detect_rotation_page`):**
-
-| Priority | Strategy | Trigger |
-|---|---|---|
-| 1 | **Keyword probe** (primary) | Runs Tesseract at all 4 rotations (0°, 90°, 180°, 270°) on page body (below top 25%); picks the rotation with the highest AWB keyword count. Requires ≥ 2 keyword matches to override upright. |
-| 2 | **OSD non-zero** (`--psm 0 --oem 0`) | Runs only if keyword probe is inconclusive (all scores = 0). `orientation_conf ≥ 3.0` **and** `rotate ≠ 0` → trust immediately. |
-| 3 | **OSD zero** | OSD was confident 0° → return 0° |
-| 4 | **Give up** | Return 0° (no rotation detected, deferred to gradient in render step) |
-
-**Strategy 3 — Generic rotation probe:**
-
-OSD is unreliable when a page has a portrait company header at the top and landscape HAWB content below — the portrait header dominates and OSD confidently returns 0°. The probe avoids this by working entirely on the **page body** (the area below the top 25%) and scoring all four rotations for HAWB keyword density:
-
-```
-┌─────────────────────────┐
-│     COMPANY HEADER      │  ← excluded (top 25%)
-├─────────────────────────┤
-│                         │
-│   body — OCR scored     │  ← scored at k = 0, 1, 2, 3 rotations
-│   at all 4 rotations    │
-│                         │
-└─────────────────────────┘
-
-best k=1 (90°  CCW readable) → HAWB printed landscape 90° CW  → correction 90° CCW
-best k=2 (180° readable)     → HAWB printed upside-down       → correction 180°
-best k=3 (270° CCW readable) → HAWB printed landscape 90° CCW → correction 270° CCW
-best k=0 (upright wins)      → page is truly portrait         → no rotation
-```
-
-AWB keywords scored: `shipper`, `consignee`, `air waybill`, `waybill`, `hawb`, `manifest`, `master`, `flight`, `departure`, `destination`, `pieces`, `weight`, `sender`, `notify`, `house`, `apt dest`, `hawb n`, `nature of goods`, `chargeable`, `issuing carrier`, `gross weight`. Decision rule: the rotation with the highest keyword count wins, provided it scores ≥ 2 keywords; ties resolve via k order (lower k preferred).
-
-**Coordinate system note:** numpy and fitz (PDF math) have opposite y-axis directions. The `_CORRECTION` mapping accounts for this:
-
-| numpy `rot90(k)` | Screen result | Correct fitz correction |
-|---|---|---|
-| k=1 | 90° CCW | `fitz.prerotate(270)` |
-| k=2 | 180° | `fitz.prerotate(180)` |
-| k=3 | 90° CW | `fitz.prerotate(90)` |
-
-OSD notes:
-- `--oem 0` (legacy engine) is mandatory for `--psm 0`; `--oem 1` (LSTM) is silently incompatible with OSD.
-- Results with `orientation_conf < 3.0` are discarded.
-
-**Render-step fallback (gradient orientation):** for pages where the presplitter found no rotation (sparse pages, e.g. a near-empty final AMS Manifest page), `_render_pages` compares pixel gradient scores at 0° and 90° and carries forward the last known correction within the same document if ambiguous.
-
-**Presplitter carry-forward:** `presplit_pdf_fast` propagates detected rotation to subsequent pages within the same document that had no own detection result. This is scoped to the document boundary to prevent contaminating the next MAWB block.
-
-**Other rendering parameters:**
-- Safety cap: max 20 images per API call (overridable via `max_images`).
-- Rendering DPI: `fitz.Matrix(1.5, 1.5)` ≈ 108 DPI → ~1263 px long side for A4, just under Claude's 1568 px resize threshold (optimal quality-to-token ratio).
-- Text-only fallback (`extract_from_text`) is available when PDF bytes are absent.
+- the email workflow is only partially wired
+- some modules still have legacy compatibility paths that reflect previous implementations
+- configuration is still spread across local environment variables and module-level defaults
 
 ---
 
-### 4.4 iCargo IBS Integration — `ICargoIBSClient`
+## 7. Practical Repository Summary
 
-Communicates with the **iCargo IBS** REST API via Bearer token authentication:
+The repository is best understood as a layered PoC with three operational pillars:
 
-```
-POST /auth/m4/private/v1/authenticate                       → obtains id_token
-GET  /icargo-api/m4/enterprise/v2/awbs/{awb_number}         → retrieves AWB record
-```
+1. Ingest and prepare documents
+2. Extract AWB structure using vision-first AI
+3. Compare extracted values with iCargo records
 
-Credentials and base URL are injected via environment variables (`.env` file):
+That is the architecture represented by the current source tree and runtime behavior.
 
-| Variable           | Description                    |
-|--------------------|-------------------------------|
-| `ICARGO_BASE_URL`  | iCargo environment base URL   |
-| `ICARGO_USERNAME`  | Service account username      |
-| `ICARGO_PASSWORD`  | Service account password      |
-| `ICARGO_TIMEOUT`   | HTTP timeout in seconds       |
-
----
-
-### 4.5 Diff & Comparison — `awb_diff_ibs.py`
-
-`diff_awb(extracted, icargo_flat)` produces a list of `DiffRow` dicts, one per field:
-
-```python
-{
-    "field": "shipper",
-    "pdf_llm": "ACME LOGISTICS SRL",
-    "icargo": "ACME LOGISTICS S.R.L.",
-    "match": False
-}
-```
-
-Normalisation applied before comparison:
-- **Strings:** strip, collapse whitespace, case-insensitive.
-- **Airport codes:** uppercase 3-letter IATA.
 - **Weights / numeric fields:** parse from various formats (`"150 kg"`, `{"value":150,"unit":"kg"}`, `150.0`).
 - **AWB numbers:** normalise to `NNN-NNNNNNNN` format.
 
