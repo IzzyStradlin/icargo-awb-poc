@@ -384,6 +384,34 @@ def _editor_rows_with_apply(rows: list[dict], default_apply_mismatch: bool = Tru
     return editor_rows
 
 
+def _empty_placeholder_uld_sections(value):
+    """Replace ULD sections containing only empty or zero values with empty collections."""
+    if isinstance(value, list):
+        return [_empty_placeholder_uld_sections(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    normalized = {
+        key: _empty_placeholder_uld_sections(item)
+        for key, item in value.items()
+    }
+    for key, item in normalized.items():
+        key_name = "".join(character for character in str(key).lower() if character.isalnum())
+        if key_name.startswith("uld") and not _has_uld_content(item):
+            normalized[key] = [] if isinstance(item, list) else {}
+    return normalized
+
+
+def _has_uld_content(value) -> bool:
+    if isinstance(value, dict):
+        return any(_has_uld_content(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_uld_content(item) for item in value)
+    if isinstance(value, str):
+        return bool(value.strip()) and value.strip() != "0"
+    return value not in (None, 0, False)
+
+
 def _build_awb_update_payload(
     base_awb: dict,
     extracted_mawb: dict,
@@ -546,7 +574,7 @@ def _build_awb_update_payload(
     if "commodity" in selected_fields and commodity_v:
         rating_details[0]["commodity"] = str(commodity_v)
 
-    return payload
+    return _empty_placeholder_uld_sections(payload)
 
 
 def _bisect_hawb_payload_fields(ic: "ICargoIBSClient", awb_code: str, raw_hawb: dict) -> list[tuple[str, bool, str]]:
