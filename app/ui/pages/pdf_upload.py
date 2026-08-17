@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # ── Cached Vision extractor ────────────────────────────────────────────────
 @st.cache_resource
 def get_vision_extractor(
-    provider_name: str = "msc_tech_ai",
+    provider_name: str = "claude",
     png_folder: Optional[str] = None,
     json_folder: Optional[str] = None,
     group_label: Optional[str] = None,
@@ -161,6 +161,7 @@ class ICargoIBSClient:
     def save_awb(self, awb_code: str, payload: dict) -> str:
         self._ensure_preprod_write()
         url = f"{self.base_url}/icargo-api/m4/enterprise/v2/awbs/{awb_code}"
+        logger.info("POST AWB %s payload: %s", awb_code, json.dumps(payload, default=str))
         r = self._request("POST", url, json_body=payload)
         if r.status_code != 200:
             raise RuntimeError(f"Error POST AWB: {r.status_code} {r.text}")
@@ -169,6 +170,9 @@ class ICargoIBSClient:
     def save_hawbs(self, awb_code: str, payload: list[dict]) -> str:
         self._ensure_preprod_write()
         url = f"{self.base_url}/icargo-api/m4/enterprise/v2/awbs/{awb_code}/hawbs"
+        # Confirmed via the real Swagger spec: the endpoint expects a JSON array body
+        # (our earlier per-object-without-array theory was wrong).
+        logger.info("POST HAWBs %s payload: %s", awb_code, json.dumps(payload, default=str))
         r = self._request("POST", url, json_body=payload)
         if r.status_code != 200:
             raise RuntimeError(f"Error POST HAWBs: {r.status_code} {r.text}")
@@ -285,7 +289,11 @@ def _to_float(value) -> Optional[float]:
 
 def _coalesce_value(field: str, edited_values: dict[str, object], extracted_values: dict) -> object:
     if field in edited_values:
-        return edited_values.get(field)
+        value = edited_values.get(field)
+        # A blanked-out editor cell should fall back to the original value,
+        # not silently become 0/empty (e.g. pieces=0 sent instead of skipping the edit).
+        if value not in (None, "", "—"):
+            return value
     return extracted_values.get(field)
 
 
@@ -327,7 +335,6 @@ HAWB_POST_EDITABLE_FIELDS = [
     "chargeable_weight",
     "volume",
     "goods_description",
-    "currency",
     "rate",
     "total_charge",
     "declared_value_carriage",
@@ -340,9 +347,6 @@ HAWB_POST_EDITABLE_FIELDS = [
     "hs_code",
     "special_handling",
     "dimensions",
-    "unit_weight",
-    "unit_volume",
-    "unit_length",
 ]
 
 
@@ -507,8 +511,11 @@ def _build_awb_update_payload(
         uom["length"] = str(unit_length_v).strip().lower()
 
     # Ensure minimal required structures remain present.
+    # NOTE: do NOT fabricate a "routing" default here — a placeholder entry with
+    # a fake carrier ("XX") triggered ICO_AWB_010 "Invalid ULD". Routing isn't a
+    # user-editable field (not in MAWB_POST_EDITABLE_FIELDS), so leave whatever
+    # routing already exists on the fetched AWB record untouched.
     payload.setdefault("unit_of_measures", {"weight": "kg", "volume": "cbm", "length": "m"})
-    payload.setdefault("routing", [{"destination": payload.get("destination"), "carrier": "XX"}])
     payload.setdefault("applicable_charges", {"rating_details": [{
         "nature_of_goods": payload.get("shipment_description") or "GENERAL CARGO",
         "pieces": payload.get("stated_pieces") or 1,
@@ -542,19 +549,83 @@ def _build_awb_update_payload(
     return payload
 
 
+def _bisect_hawb_payload_fields(ic: "ICargoIBSClient", awb_code: str, raw_hawb: dict) -> list[tuple[str, bool, str]]:
+    """Debug helper: POST the raw HAWB record repeatedly, each time dropping one
+    top-level key, to find which field the write endpoint rejects (stops at the
+    first key whose removal makes the call succeed).
+    """
+    results: list[tuple[str, bool, str]] = []
+    for key in list(raw_hawb.keys()):
+        trial = {k: v for k, v in raw_hawb.items() if k != key}
+        try:
+            ic.save_hawbs(awb_code, [trial])
+            results.append((key, True, "OK without this field"))
+            break
+        except Exception as e:
+            results.append((key, False, str(e)))
+    return results
+
+
+# Fields observed in the raw GET record that look like read-only/legacy business
+# extras rather than core update data — the first suspects for an unknown-field
+# rejection when no single-field removal fixes the write.
+_HAWB_EXOTIC_FIELDS = [
+    "handling_codes", "dimension", "other_customs_information",
+    "unit_of_measures", "remarks", "slac_pieces",
+]
+
+
+def _test_minimal_hawb_payload(ic: "ICargoIBSClient", awb_code: str, raw_hawb: dict) -> tuple[bool, str, dict]:
+    """Try a payload stripped of all exotic fields at once; if it succeeds, add
+    each exotic field back one at a time to find which one(s) break it.
+    """
+    minimal = {k: v for k, v in raw_hawb.items() if k not in _HAWB_EXOTIC_FIELDS}
+    try:
+        msg = ic.save_hawbs(awb_code, [dict(minimal)])
+        return True, f"Minimal payload OK: {msg}", minimal
+    except Exception as e:
+        return False, str(e), minimal
+
+
+def _readd_exotic_fields_one_by_one(ic: "ICargoIBSClient", awb_code: str, raw_hawb: dict, minimal: dict) -> list[tuple[str, bool, str]]:
+    results: list[tuple[str, bool, str]] = []
+    for key in _HAWB_EXOTIC_FIELDS:
+        if key not in raw_hawb:
+            continue
+        trial = dict(minimal)
+        trial[key] = raw_hawb[key]
+        try:
+            ic.save_hawbs(awb_code, [trial])
+            results.append((key, True, "OK with this field too"))
+        except Exception as e:
+            results.append((key, False, str(e)))
+    return results
+
+
 def _build_hawb_detail_payload(
     awb_code: str,
     hawb_data: dict,
     selected_fields: set[str],
     edited_values: dict[str, object],
+    raw_icargo_hawb: Optional[dict] = None,
 ) -> dict:
-    out: dict = {}
+    """Build a HAWB update payload matching the real iCargo Swagger schema for
+    POST /awbs/{awb}/hawbs (array body): awb/hawb identifiers (with dash),
+    3-letter IATA origin/destination, bare pieces/weight, harmonised_commodity_code,
+    nested shipper/consignee objects, and a unit_of_measures block.
+
+    `raw_icargo_hawb`, when available, is the record as returned live by iCargo's
+    own GET — it's the base for any field NOT explicitly selected for edit, so we
+    never resend our own PDF-extraction values/formats (e.g. internal composite
+    location codes like "ITMOD" instead of the real IATA code "BLQ") for fields
+    the user didn't touch.
+    """
+    out: dict = dict(raw_icargo_hawb) if raw_icargo_hawb else {}
     hawb_num_v = _coalesce_value("hawb_number", edited_values, hawb_data)
-    hawb_num = str(hawb_num_v or hawb_data.get("hawb") or "").strip()
+    hawb_num = str(hawb_num_v or hawb_data.get("hawb") or out.get("hawb") or "").strip()
     out["awb"] = awb_code
     out["hawb"] = hawb_num
 
-    # Required by API schema (always provide from extracted values/fallbacks)
     origin_v = _coalesce_value("origin", edited_values, hawb_data)
     destination_v = _coalesce_value("destination", edited_values, hawb_data)
     pieces_v = _coalesce_value("pieces", edited_values, hawb_data)
@@ -565,27 +636,44 @@ def _build_hawb_detail_payload(
     hs_code_v = _coalesce_value("hs_code", edited_values, hawb_data)
     special_handling_v = _coalesce_value("special_handling", edited_values, hawb_data)
 
-    out["origin"] = str(origin_v or "").strip().upper()
-    out["destination"] = str(destination_v or "").strip().upper()
-    out["pieces"] = _to_int(pieces_v) or 0
-    out["weight"] = _to_float(weight_v) or 0.0
-    out["shipment_description"] = str(goods_v or "GENERAL CARGO")
-    out["unit_of_measures"] = {"weight": "kg", "volume": "cbm", "length": "m"}
+    # Required by API schema — only overwrite with our own extracted value when
+    # the user actually selected that field; otherwise keep iCargo's own value.
+    if "origin" in selected_fields and origin_v:
+        out["origin"] = str(origin_v).strip().upper()
+    else:
+        out.setdefault("origin", str(origin_v or "").strip().upper())
+    if "destination" in selected_fields and destination_v:
+        out["destination"] = str(destination_v).strip().upper()
+    else:
+        out.setdefault("destination", str(destination_v or "").strip().upper())
+    if "pieces" in selected_fields:
+        p_int = _to_int(pieces_v)
+        if p_int is not None:
+            out["pieces"] = p_int
+    else:
+        out.setdefault("pieces", _to_int(pieces_v) or 0)
+    if "weight" in selected_fields:
+        w_float = _to_float(weight_v)
+        if w_float is not None:
+            out["weight"] = w_float
+    else:
+        out.setdefault("weight", _to_float(weight_v) or 0.0)
+    if "goods_description" in selected_fields and goods_v:
+        out["shipment_description"] = str(goods_v)
+    else:
+        out.setdefault("shipment_description", str(goods_v or "GENERAL CARGO"))
+    out.setdefault("unit_of_measures", {"weight": "kg", "volume": "cbm", "length": "m"})
 
     chargeable_weight_v = _coalesce_value("chargeable_weight", edited_values, hawb_data)
     volume_v = _coalesce_value("volume", edited_values, hawb_data)
-    currency_v = _coalesce_value("currency", edited_values, hawb_data)
-    rate_v = _coalesce_value("rate", edited_values, hawb_data)
     total_charge_v = _coalesce_value("total_charge", edited_values, hawb_data)
     declared_value_carriage_v = _coalesce_value("declared_value_carriage", edited_values, hawb_data)
     declared_value_customs_v = _coalesce_value("declared_value_customs", edited_values, hawb_data)
+    rate_v = _coalesce_value("rate", edited_values, hawb_data)
     notify_party_v = _coalesce_value("notify_party", edited_values, hawb_data)
     flight_date_v = _coalesce_value("flight_date", edited_values, hawb_data)
     flight_num_v = _coalesce_value("flight_number", edited_values, hawb_data)
     dimensions_v = _coalesce_value("dimensions", edited_values, hawb_data)
-    unit_weight_v = _coalesce_value("unit_weight", edited_values, hawb_data)
-    unit_volume_v = _coalesce_value("unit_volume", edited_values, hawb_data)
-    unit_length_v = _coalesce_value("unit_length", edited_values, hawb_data)
 
     # Optional mapped fields when selected
     if "hs_code" in selected_fields and hs_code_v:
@@ -613,7 +701,7 @@ def _build_hawb_detail_payload(
         }
 
     if "notify_party" in selected_fields and notify_party_v:
-        out["notify_party"] = {"name": str(notify_party_v)}
+        out["remarks"] = str(notify_party_v)
 
     if "chargeable_weight" in selected_fields:
         cw_float = _to_float(chargeable_weight_v)
@@ -623,8 +711,6 @@ def _build_hawb_detail_payload(
         vol_float = _to_float(volume_v)
         if vol_float is not None:
             out["volume"] = vol_float
-    if "currency" in selected_fields and currency_v:
-        out["currency"] = str(currency_v).strip().upper()
     if "rate" in selected_fields:
         rate_float = _to_float(rate_v)
         if rate_float is not None:
@@ -638,27 +724,21 @@ def _build_hawb_detail_payload(
     if "declared_value_customs" in selected_fields and declared_value_customs_v not in (None, "", "—"):
         out["declared_value_customs"] = str(declared_value_customs_v)
 
-    if ("flight_date" in selected_fields and flight_date_v) or ("flight_number" in selected_fields and flight_num_v):
-        raw_flight = str(flight_num_v or "").strip().upper()
+    if "flight_number" in selected_fields and flight_num_v:
+        raw_flight = str(flight_num_v).strip().upper()
         carrier = "".join(ch for ch in raw_flight[:2] if ch.isalpha())
         flight_number = "".join(ch for ch in raw_flight[2:] if ch.isdigit())
-        out["requested_flight"] = [{
-            "carrier_code": carrier,
-            "flight_number": flight_number,
-            "flight_date": str(flight_date_v or ""),
-            "origin": out.get("origin"),
-            "destination": out.get("destination"),
-        }]
+        if carrier and flight_number:
+            out["requested_flight"] = [{
+                "carrier_code": carrier,
+                "flight_number": flight_number,
+                "flight_date": str(flight_date_v or ""),
+                "origin": out.get("origin"),
+                "destination": out.get("destination"),
+            }]
 
     if "dimensions" in selected_fields and dimensions_v:
-        out["dimensions"] = str(dimensions_v)
-
-    if "unit_weight" in selected_fields and unit_weight_v:
-        out["unit_of_measures"]["weight"] = str(unit_weight_v).strip().lower()
-    if "unit_volume" in selected_fields and unit_volume_v:
-        out["unit_of_measures"]["volume"] = str(unit_volume_v).strip().lower()
-    if "unit_length" in selected_fields and unit_length_v:
-        out["unit_of_measures"]["length"] = str(unit_length_v).strip().lower()
+        out["dimension"] = str(dimensions_v)
 
     return out
 
@@ -949,7 +1029,7 @@ def render_pdf_upload(on_back):
             "claude": "Claude Vision (API)",
             "msc_tech_ai": "MSC Tech AI (File-based)"
         }.get(v, v),
-        index=1,
+        index=0,
         key="vision_provider_select",
     )
 
@@ -959,8 +1039,8 @@ def render_pdf_upload(on_back):
             "The app resolves browser URLs to the local OneDrive sync folder of the current user, and the selected folders are persisted in .env."
         )
         st.markdown(
-            "**Nota:** l'utente che esegue l'app deve avere la libreria SharePoint sincronizzata con OneDrive. "
-            "Inserisci un percorso locale o un URL SharePoint/OneDrive; l'app proverà a risolvere l'URL in un percorso locale valido."
+            "**Note:** the user running the app must have the SharePoint library synced with OneDrive. "
+            "Enter a local path or a SharePoint/OneDrive URL; the app will try to resolve the URL to a valid local path."
         )
 
         if "msc_png_folder" not in st.session_state:
@@ -1499,6 +1579,7 @@ def render_pdf_upload(on_back):
             fetch_compare = st.button("Fetch & Compare iCargo", key=f"icargo_{idx}", type="primary")
 
             if fetch_compare:
+                st.session_state.pop(f"force_deselect_{compare_state_key}", None)
                 if not awb_for_icargo:
                     st.warning(
                         "Invalid AWB number for iCargo query. "
@@ -1731,13 +1812,31 @@ def render_pdf_upload(on_back):
                     "apply": st.column_config.CheckboxColumn("apply"),
                 }
                 st.caption(f"Write target: {os.getenv('ICARGO_BASE_URL') or 'https://mac-stag-icargo.ibsplc.aero'}")
+                if st.button("🚫 Deselect all 'apply'", key=f"deselect_all_{compare_state_key}"):
+                    hawb_prefix = f"hawb_editor_{compare_state_key}_"
+                    keys_to_clear = [
+                        k for k in st.session_state.keys()
+                        if k == f"mawb_editor_{compare_state_key}" or k.startswith(hawb_prefix)
+                    ]
+                    for k in keys_to_clear:
+                        del st.session_state[k]
+                    # Persist the flag (don't pop it) — data_editor only keeps a diff on
+                    # top of the freshly recomputed base rows each rerun, so if we stopped
+                    # forcing apply=False after one render, editing any single cell would
+                    # make every other mismatched row's checkbox reappear as checked.
+                    st.session_state[f"force_deselect_{compare_state_key}"] = True
+                    st.rerun()
+                force_deselect = st.session_state.get(f"force_deselect_{compare_state_key}", False)
                 st.markdown("##### MAWB")
                 mawb_rows_augmented = _augment_rows_with_post_fields(
                     compare_data.get("mawb_rows", []),
                     display_mawb,
                     MAWB_POST_EDITABLE_FIELDS,
                 )
-                mawb_editor_rows = _editor_rows_with_apply(mawb_rows_augmented)
+                mawb_editor_rows = _editor_rows_with_apply(
+                    mawb_rows_augmented,
+                    default_apply_mismatch=not force_deselect,
+                )
                 edited_mawb = st.data_editor(
                     mawb_editor_rows,
                     width='stretch',
@@ -1765,9 +1864,9 @@ def render_pdf_upload(on_back):
                         label = rec.get("pdf_hawb") or rec.get("icargo_hawb") or f"HAWB_{hi+1}"
                         suffix = f" ↔ iCargo {rec.get('icargo_hawb')}" if rec.get("icargo_hawb") else ""
                         if status == "pdf_only":
-                            st.markdown(f"###### 🔍 {label} — solo PDF")
+                            st.markdown(f"###### 🔍 {label} — PDF only")
                         elif status == "icargo_only":
-                            st.markdown(f"###### 🔍 {label} — solo iCargo (editabile)")
+                            st.markdown(f"###### 🔍 {label} — iCargo only (editable)")
                         else:
                             st.markdown(f"###### {label}{suffix}")
 
@@ -1788,7 +1887,7 @@ def render_pdf_upload(on_back):
                         )
                         editor_rows = _editor_rows_with_apply(
                             hawb_rows_augmented,
-                            default_apply_mismatch=(status != "icargo_only"),
+                            default_apply_mismatch=(status != "icargo_only") and not force_deselect,
                         )
                         edited_hawb = st.data_editor(
                             editor_rows,
@@ -1798,6 +1897,58 @@ def render_pdf_upload(on_back):
                             column_config=editor_column_config,
                             key=f"hawb_editor_{compare_state_key}_{hi}",
                         )
+
+                        raw_icargo_hawb = rec.get("icargo_hawb_data")
+                        if raw_icargo_hawb:
+                            col_rt, col_bisect = st.columns(2)
+                            with col_rt:
+                                if st.button(
+                                    f"🧪 Round-trip test {label}",
+                                    key=f"roundtrip_{compare_state_key}_{hi}",
+                                    help="Resends the record to iCargo exactly as returned by GET, unchanged — isolates whether the problem is in the schema or in edited values.",
+                                ):
+                                    try:
+                                        ic = ICargoIBSClient()
+                                        msg = ic.save_hawbs(awb_for_icargo, [dict(raw_icargo_hawb)])
+                                        st.success(f"✅ Round-trip OK: {msg}")
+                                    except Exception as e:
+                                        st.error(f"Round-trip fallito: {e}")
+                            with col_bisect:
+                                if st.button(
+                                    f"🔬 Field bisection {label}",
+                                    key=f"bisect_{compare_state_key}_{hi}",
+                                    help="Removes one field at a time from the raw record and retries, to isolate which field causes the rejection.",
+                                ):
+                                    ic = ICargoIBSClient()
+                                    with st.spinner("Bisection in progress..."):
+                                        bisect_results = _bisect_hawb_payload_fields(ic, awb_for_icargo, dict(raw_icargo_hawb))
+                                    st.dataframe(
+                                        [{"removed_field": k, "result": "OK" if ok else "failed", "detail": msg} for k, ok, msg in bisect_results],
+                                        width='stretch',
+                                    )
+                                    if bisect_results and bisect_results[-1][1]:
+                                        st.success(f"Suspect field: '{bisect_results[-1][0]}' — removing it makes the POST succeed.")
+                                    else:
+                                        st.warning("No single removal fixes it — likely a combination of fields or a missing field.")
+
+                            if st.button(
+                                f"🧪 Minimal test (no exotic fields) {label}",
+                                key=f"minimal_{compare_state_key}_{hi}",
+                                help="Removes handling_codes/dimension/other_customs_information/unit_of_measures/remarks/slac_pieces together and retries; if it works, adds them back one at a time.",
+                            ):
+                                ic = ICargoIBSClient()
+                                with st.spinner("Testing minimal payload..."):
+                                    ok, msg, minimal = _test_minimal_hawb_payload(ic, awb_for_icargo, dict(raw_icargo_hawb))
+                                if ok:
+                                    st.success(f"✅ {msg}")
+                                    with st.spinner("Re-adding exotic fields one at a time..."):
+                                        readd_results = _readd_exotic_fields_one_by_one(ic, awb_for_icargo, dict(raw_icargo_hawb), minimal)
+                                    st.dataframe(
+                                        [{"readded_field": k, "result": "OK" if ok2 else "failed", "detail": m} for k, ok2, m in readd_results],
+                                        width='stretch',
+                                    )
+                                else:
+                                    st.error(f"Minimal payload failed too: {msg}")
 
                         hawb_edited_rows = _to_records(edited_hawb)
                         selected_fields = _selected_fields_from_rows(hawb_edited_rows)
@@ -1812,6 +1963,7 @@ def render_pdf_upload(on_back):
                                 "hawb_data": hawb_payload_source,
                                 "selected_fields": selected_fields,
                                 "edited_values": edited_values,
+                                "raw_icargo_hawb": rec.get("icargo_hawb_data"),
                             })
 
                 with st.expander("🧪 HAWB diagnostic panel", expanded=False):
@@ -1823,15 +1975,15 @@ def render_pdf_upload(on_back):
 
                 col_m, col_h, col_all = st.columns(3)
                 with col_m:
-                    update_master_btn = st.button("📝 Aggiorna Master", key=f"upd_master_{compare_state_key}")
+                    update_master_btn = st.button("📝 Update Master", key=f"upd_master_{compare_state_key}")
                 with col_h:
-                    update_house_btn = st.button("🏠 Aggiorna House", key=f"upd_house_{compare_state_key}")
+                    update_house_btn = st.button("🏠 Update House", key=f"upd_house_{compare_state_key}")
                 with col_all:
-                    update_all_btn = st.button("🚀 Aggiorna Tutto", key=f"upd_all_{compare_state_key}", type="primary")
+                    update_all_btn = st.button("🚀 Update All", key=f"upd_all_{compare_state_key}", type="primary")
 
                 def _do_update_master() -> bool:
                     if not selected_mawb_fields:
-                        st.warning("Seleziona almeno un campo MAWB da aggiornare.")
+                        st.warning("Select at least one MAWB field to update.")
                         return False
                     ic = ICargoIBSClient()
                     payload = _build_awb_update_payload(
@@ -1842,12 +1994,12 @@ def render_pdf_upload(on_back):
                         awb_for_icargo,
                     )
                     msg = ic.save_awb(awb_for_icargo, payload)
-                    st.success(f"✅ Master aggiornata: {msg}")
+                    st.success(f"✅ Master updated: {msg}")
                     return True
 
                 def _do_update_house() -> bool:
                     if not hawb_payload_candidates:
-                        st.warning("Seleziona almeno un campo HAWB da aggiornare.")
+                        st.warning("Select at least one HAWB field to update.")
                         return False
                     payload_list: list[dict] = []
                     for item in hawb_payload_candidates:
@@ -1856,15 +2008,16 @@ def render_pdf_upload(on_back):
                             item["hawb_data"],
                             item["selected_fields"],
                             item.get("edited_values") or {},
+                            raw_icargo_hawb=item.get("raw_icargo_hawb"),
                         )
                         if hawb_payload.get("hawb"):
                             payload_list.append(hawb_payload)
                     if not payload_list:
-                        st.warning("Nessuna HAWB valida da inviare.")
+                        st.warning("No valid HAWB to send.")
                         return False
                     ic = ICargoIBSClient()
                     msg = ic.save_hawbs(awb_for_icargo, payload_list)
-                    st.success(f"✅ House aggiornate: {msg}")
+                    st.success(f"✅ House updated: {msg}")
                     return True
 
                 try:

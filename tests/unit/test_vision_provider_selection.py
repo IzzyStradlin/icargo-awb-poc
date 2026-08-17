@@ -13,6 +13,17 @@ class DummyProvider:
         return '{"mawb": null, "hawbs": []}'
 
 
+class ConsolidatedDummyProvider:
+    def extract_mawb_with_hawbs_json(self, *args, **kwargs):
+        return (
+            '{"document_type": "CONSOLIDATED_MAWB", '
+            '"mawb": {"awb_number": "233-10169294"}, '
+            '"house_awbs": [{"hawb_number": "MIL0333227"}], '
+            '"reconciliation": {"status": "WARNING"}, '
+            '"warnings": [{"code": "GROSS_WEIGHT_MISMATCH", "message": "Check weights"}]}'
+        )
+
+
 def test_awb_vision_extractor_can_use_msc_tech_provider(tmp_path):
     extractor = AwbVisionExtractor(provider_name="msc_tech_ai")
 
@@ -218,6 +229,18 @@ def test_awb_vision_extractor_normalizes_null_mawb_payload():
     assert isinstance(result["mawb"], dict)
     assert result["mawb"] == {}
     assert result["hawbs"] == []
+
+
+def test_awb_vision_extractor_normalizes_consolidated_house_awbs_payload():
+    extractor = AwbVisionExtractor(provider_name="msc_tech_ai")
+    extractor._provider = ConsolidatedDummyProvider()
+
+    result = extractor.extract_mawb_with_hawbs(b"PDF")
+
+    assert result["document_type"] == "CONSOLIDATED_MAWB"
+    assert result["hawbs"] == [{"hawb_number": "MIL0333227"}]
+    assert result["reconciliation"]["status"] == "WARNING"
+    assert result["warnings"][0]["code"] == "GROSS_WEIGHT_MISMATCH"
 
 
 def test_msc_tech_provider_does_not_settle_before_all_expected_json_files_arrive(monkeypatch, tmp_path):

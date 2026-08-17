@@ -8,9 +8,47 @@ alternative in the UI.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 from .awb_llm_parser import parse_llm_json
+
+
+def _normalize_hawb_key(hawb: Dict[str, Any]) -> str:
+    raw = str(
+        hawb.get("hawb_number")
+        or hawb.get("hawbNumber")
+        or hawb.get("hawb")
+        or hawb.get("houseAirwaybillNumber")
+        or ""
+    )
+    return re.sub(r"[^A-Z0-9]", "", raw.upper())
+
+
+def _dedupe_hawbs(hawbs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse duplicate HAWB entries Claude sometimes emits when the same
+    house appears on more than one page (cover + manifest) — keeps the most
+    complete record per unique hawb_number, preserving unresolved/empty keys.
+    """
+    best: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for hawb in hawbs:
+        if not isinstance(hawb, dict):
+            continue
+        key = _normalize_hawb_key(hawb)
+        if not key:
+            order.append(f"__unkeyed_{len(order)}")
+            best[order[-1]] = hawb
+            continue
+        if key not in best:
+            order.append(key)
+            best[key] = hawb
+        else:
+            score_new = sum(1 for v in hawb.values() if v not in (None, ""))
+            score_old = sum(1 for v in best[key].values() if v not in (None, ""))
+            if score_new > score_old:
+                best[key] = hawb
+    return [best[k] for k in order]
 
 
 class AwbVisionExtractor:
@@ -116,9 +154,16 @@ class AwbVisionExtractor:
         if data.get("mawb") is None:
             data["mawb"] = {}
 
+        # Accept the consolidated output shape used by ChatGPT/Claude prompts
+        # while keeping the existing application's `hawbs` contract.
+        if not isinstance(data.get("hawbs"), list) and isinstance(data.get("house_awbs"), list):
+            data["hawbs"] = data["house_awbs"]
+
         # Ensure hawbs is always a list
         if not isinstance(data.get("hawbs"), list):
             data["hawbs"] = []
+
+        data["hawbs"] = _dedupe_hawbs(data["hawbs"])
 
         return data
 

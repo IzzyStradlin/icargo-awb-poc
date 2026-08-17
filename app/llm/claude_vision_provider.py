@@ -91,6 +91,38 @@ declared_value_customs  — declared value for customs, null if not stated
 currency          — currency code (e.g. "EUR", "USD"), null if not stated
 
 Return ONLY the JSON object.\
+
+== CONSOLIDATION AND QUALITY CHECKS ==
+Treat all supplied images as one shipment package. Link every HAWB to the
+MAWB shown in the documents, and include every distinct HAWB found in a
+manifest or individual HAWB page. Do not invent values: use null when a field
+cannot be read, and preserve the text as printed when OCR is uncertain.
+
+In addition to "mawb" and "hawbs", return these top-level keys:
+"document_type": "CONSOLIDATED_MAWB",
+"reconciliation": {
+    "hawb_count": <number of extracted HAWBs>,
+    "manifest_gross_weight_total_kg": <sum of HAWB gross weights when available>,
+    "mawb_gross_weight_kg": <MAWB gross weight when available>,
+    "gross_weight_difference_kg": <MAWB weight minus HAWB sum when both are available>,
+    "status": "OK" or "WARNING",
+    "warnings": [
+        {"code": "SHORT_CODE", "message": "Specific, evidence-based issue"}
+    ]
+},
+"warnings": [
+    {"code": "SHORT_CODE", "message": "Specific, evidence-based issue"}
+]
+
+Reconcile the number of HAWBs and the sum of their gross weights against the
+MAWB. Add warnings for weight or count mismatches, duplicate or suspicious
+identifiers, ambiguous OCR, missing required values, inconsistent routing,
+or suspiciously similar shipper/consignee data. Warnings must describe the
+actual evidence found in the images, not generic advice. Use an empty array
+when no issue is detected. Keep the same warning objects in both
+"reconciliation.warnings" and the top-level "warnings" array.
+
+Return ONLY the JSON object.
 """
 
 _MAWB_HAWB_PROMPT = """\
@@ -407,6 +439,9 @@ class ClaudeVisionProvider:
         payload = {
             "model": self.MODEL,
             "max_tokens": max_tokens,
+            # Low temperature reduces run-to-run variance (e.g. duplicated
+            # HAWBs re-listed from cover + manifest pages) on identical inputs.
+            "temperature": 0,
             "messages": [{"role": "user", "content": content}],
         }
         last_err: Optional[Exception] = None
