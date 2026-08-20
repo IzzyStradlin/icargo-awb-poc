@@ -250,6 +250,9 @@ ICARGO_USERNAME=your-username
 ICARGO_PASSWORD=your-password
 ICARGO_TIMEOUT=15
 
+# Flight Tracking (AirLabs Flight Tracker API)
+AIRLABS_API_KEY=your-airlabs-api-key
+
 # PDF Extraction
 PDF_OCR_LANG=eng
 PDF_OCR_DPI=200
@@ -650,6 +653,7 @@ Input Text (AWB document)
 | `ICARGO_BASE_URL` | Yes | - | iCargo IBS API base URL |
 | `ICARGO_USERNAME` | Yes | - | iCargo authentication username |
 | `ICARGO_PASSWORD` | Yes | - | iCargo authentication password |
+| `AIRLABS_API_KEY` | No | - | AirLabs API key (for Flight Tracking; get one at [airlabs.co](https://airlabs.co)) |
 | `TESSERACT_PATH` | No | - | Path to Tesseract executable (Windows) |
 
 ### OCR Configuration

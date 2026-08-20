@@ -1192,7 +1192,7 @@ def render_pdf_upload(on_back):
     # ── Split mode selector ────────────────────────────────────────────────
     split_mode = st.radio(
         "Pre-split mode",
-        options=["fast", "normale"],
+        options=["fast", "normal"],
         format_func=lambda x: (
             "⚡ Smart — 300 DPI, top 20% of page, parallel (recommended)"
             if x == "fast"
@@ -1502,7 +1502,8 @@ def render_pdf_upload(on_back):
                 st.rerun()
     st.divider()
     total_hawbs_all = sum(len(r.get("hawbs", [])) for r in results)
-    st.subheader(f"Results — {len(results)} MAWB, {total_hawbs_all} HAWB")
+    st.subheader(f"Results: {len(results)} MAWB | {total_hawbs_all} HAWB")
+    st.caption("Review extracted data, compare it with iCargo, then select the fields to update.")
 
     for idx, result in enumerate(results):
         raw_mawb = result.get("mawb") if isinstance(result.get("mawb"), dict) else {}
@@ -1520,14 +1521,14 @@ def render_pdf_upload(on_back):
 
         hawb_badge = f" • {len(display_hawbs)} HAWB" if display_hawbs else ""
         pdf_badge = f"  [{result.get('_pdf_name')}]" if is_zip and result.get("_pdf_name") else ""
-        with st.expander(f"📦 MAWB {awb_num}{hawb_badge}{pdf_badge}", expanded=(idx == 0)):
+        with st.expander(f"MAWB {awb_num}{hawb_badge}{pdf_badge}", expanded=(idx == 0)):
             provider_labels = {
                 "claude": "Claude Vision",
                 "msc_tech_ai": "MSC Tech AI"
             }
             provider_label = provider_labels.get(provider_name, "Unknown")
-            source_label = f"🔮 {provider_label} (re-extracted)" if refined else f"🔮 {provider_label}"
-            st.success(source_label)
+            source_label = f"Source: {provider_label} (re-extracted)" if refined else f"Source: {provider_label}"
+            st.caption(source_label)
 
             result_payload = refined if isinstance(refined, dict) else result
             assignment_mode = (result_payload or {}).get("hawb_assignment_mode")
@@ -1539,24 +1540,45 @@ def render_pdf_upload(on_back):
                     st.warning(msg)
 
             # ── MAWB fields ──────────────────────────────────────────────
-            st.markdown("#### 📋 Master Air Waybill")
+            st.markdown("#### Master Air Waybill")
             _awb_form(awb_num, display_mawb)
 
             # ── HAWB subsections ─────────────────────────────────────────
             if display_hawbs:
                 st.divider()
-                st.markdown(f"#### 🏠 House Air Waybills ({len(display_hawbs)})")
+                st.markdown(f"#### House Air Waybills ({len(display_hawbs)})")
                 for hi, hawb in enumerate(display_hawbs):
                     hawb_num = hawb.get("hawb_number") or f"HAWB_{hi+1}"
-                    with st.expander(f"📜 HAWB {hawb_num}", expanded=True):
+                    with st.expander(f"HAWB {hawb_num}", expanded=False):
                         _hawb_form(hawb_num, hawb)
             else:
-                st.caption("ℹ️ No House AWB detected in this block")
+                st.caption("No House AWB detected for this MAWB.")
 
             st.divider()
 
-            # Re-extract button
-            if st.button("🔄 Re-extract with Vision (MAWB + HAWB)", key=f"reextract_{idx}", type="secondary"):
+            action_col, download_col = st.columns([2, 1])
+            with action_col:
+                reextract_btn = st.button(
+                    "Re-extract with Vision",
+                    key=f"reextract_{idx}",
+                    type="secondary",
+                    width="stretch",
+                    help="Run extraction again for this MAWB and its House AWBs.",
+                )
+
+            # Download JSON (full: mawb + hawbs)
+            full_json = json.dumps({"mawb": display_mawb, "hawbs": display_hawbs}, indent=2, default=str)
+            with download_col:
+                st.download_button(
+                    label="Download JSON",
+                    data=full_json,
+                    file_name=f"awb_{awb_num}.json",
+                    mime="application/json",
+                    key=f"dl_{idx}",
+                    width="stretch",
+                )
+
+            if reextract_btn:
                 try:
                     with st.spinner(f"Re-extracting {awb_num}..."):
                         ext = get_vision_extractor(
@@ -1588,23 +1610,18 @@ def render_pdf_upload(on_back):
                 except Exception as e:
                     st.error(f"Re-extraction failed: {e}")
 
-            # Download JSON (full: mawb + hawbs)
-            full_json = json.dumps({"mawb": display_mawb, "hawbs": display_hawbs}, indent=2, default=str)
-            st.download_button(
-                label=f"⬇️ Download {awb_num} (JSON)",
-                data=full_json,
-                file_name=f"awb_{awb_num}.json",
-                mime="application/json",
-                key=f"dl_{idx}",
-            )
-
             st.divider()
 
             # iCargo comparison (MAWB + HAWBs)
-            st.markdown("**📊 Compare with iCargo (MAWB + HAWBs)**")
+            st.markdown("#### iCargo Comparison")
             awb_for_icargo = _resolve_awb_for_icargo(str(awb_num), display_mawb)
             compare_state_key = f"{idx}:{awb_for_icargo}"
-            fetch_compare = st.button("Fetch & Compare iCargo", key=f"icargo_{idx}", type="primary")
+            fetch_compare = st.button(
+                "Compare with iCargo",
+                key=f"icargo_{idx}",
+                type="primary",
+                help="Fetch the current iCargo record and display field-level differences.",
+            )
 
             if fetch_compare:
                 st.session_state.pop(f"force_deselect_{compare_state_key}", None)
@@ -1840,7 +1857,7 @@ def render_pdf_upload(on_back):
                     "apply": st.column_config.CheckboxColumn("apply"),
                 }
                 st.caption(f"Write target: {os.getenv('ICARGO_BASE_URL') or 'https://mac-stag-icargo.ibsplc.aero'}")
-                if st.button("🚫 Deselect all 'apply'", key=f"deselect_all_{compare_state_key}"):
+                if st.button("Clear all selections", key=f"deselect_all_{compare_state_key}"):
                     hawb_prefix = f"hawb_editor_{compare_state_key}_"
                     keys_to_clear = [
                         k for k in st.session_state.keys()
@@ -1892,9 +1909,9 @@ def render_pdf_upload(on_back):
                         label = rec.get("pdf_hawb") or rec.get("icargo_hawb") or f"HAWB_{hi+1}"
                         suffix = f" ↔ iCargo {rec.get('icargo_hawb')}" if rec.get("icargo_hawb") else ""
                         if status == "pdf_only":
-                            st.markdown(f"###### 🔍 {label} — PDF only")
+                            st.markdown(f"###### {label} | PDF only")
                         elif status == "icargo_only":
-                            st.markdown(f"###### 🔍 {label} — iCargo only (editable)")
+                            st.markdown(f"###### {label} | iCargo only (editable)")
                         else:
                             st.markdown(f"###### {label}{suffix}")
 
@@ -1928,55 +1945,56 @@ def render_pdf_upload(on_back):
 
                         raw_icargo_hawb = rec.get("icargo_hawb_data")
                         if raw_icargo_hawb:
-                            col_rt, col_bisect = st.columns(2)
-                            with col_rt:
-                                if st.button(
-                                    f"🧪 Round-trip test {label}",
+                            with st.expander(f"HAWB diagnostics: {label}", expanded=False):
+                                col_rt, col_bisect = st.columns(2)
+                                with col_rt:
+                                    if st.button(
+                                    "Round-trip test",
                                     key=f"roundtrip_{compare_state_key}_{hi}",
-                                    help="Resends the record to iCargo exactly as returned by GET, unchanged — isolates whether the problem is in the schema or in edited values.",
-                                ):
-                                    try:
-                                        ic = ICargoIBSClient()
-                                        msg = ic.save_hawbs(awb_for_icargo, [dict(raw_icargo_hawb)])
-                                        st.success(f"✅ Round-trip OK: {msg}")
-                                    except Exception as e:
-                                        st.error(f"Round-trip fallito: {e}")
-                            with col_bisect:
-                                if st.button(
-                                    f"🔬 Field bisection {label}",
+                                    help="Resend the record as returned by GET, without edits.",
+                                    ):
+                                        try:
+                                            ic = ICargoIBSClient()
+                                            msg = ic.save_hawbs(awb_for_icargo, [dict(raw_icargo_hawb)])
+                                            st.success(f"Round-trip successful: {msg}")
+                                        except Exception as e:
+                                            st.error(f"Round-trip failed: {e}")
+                                with col_bisect:
+                                    if st.button(
+                                    "Field bisection",
                                     key=f"bisect_{compare_state_key}_{hi}",
-                                    help="Removes one field at a time from the raw record and retries, to isolate which field causes the rejection.",
+                                    help="Remove one field at a time to identify a rejected field.",
+                                    ):
+                                        ic = ICargoIBSClient()
+                                        with st.spinner("Testing fields..."):
+                                            bisect_results = _bisect_hawb_payload_fields(ic, awb_for_icargo, dict(raw_icargo_hawb))
+                                        st.dataframe(
+                                            [{"removed_field": k, "result": "OK" if ok else "failed", "detail": msg} for k, ok, msg in bisect_results],
+                                            width='stretch',
+                                        )
+                                        if bisect_results and bisect_results[-1][1]:
+                                            st.success(f"Suspect field: '{bisect_results[-1][0]}'. Removing it makes the POST succeed.")
+                                        else:
+                                            st.warning("No single field resolves the issue. Check for a missing field or combination of fields.")
+
+                                if st.button(
+                                    "Minimal payload test",
+                                    key=f"minimal_{compare_state_key}_{hi}",
+                                    help="Remove optional fields, then add them back one at a time if the POST succeeds.",
                                 ):
                                     ic = ICargoIBSClient()
-                                    with st.spinner("Bisection in progress..."):
-                                        bisect_results = _bisect_hawb_payload_fields(ic, awb_for_icargo, dict(raw_icargo_hawb))
-                                    st.dataframe(
-                                        [{"removed_field": k, "result": "OK" if ok else "failed", "detail": msg} for k, ok, msg in bisect_results],
-                                        width='stretch',
-                                    )
-                                    if bisect_results and bisect_results[-1][1]:
-                                        st.success(f"Suspect field: '{bisect_results[-1][0]}' — removing it makes the POST succeed.")
+                                    with st.spinner("Testing minimal payload..."):
+                                        ok, msg, minimal = _test_minimal_hawb_payload(ic, awb_for_icargo, dict(raw_icargo_hawb))
+                                    if ok:
+                                        st.success(msg)
+                                        with st.spinner("Adding optional fields back..."):
+                                            readd_results = _readd_exotic_fields_one_by_one(ic, awb_for_icargo, dict(raw_icargo_hawb), minimal)
+                                        st.dataframe(
+                                            [{"readded_field": k, "result": "OK" if ok2 else "failed", "detail": m} for k, ok2, m in readd_results],
+                                            width='stretch',
+                                        )
                                     else:
-                                        st.warning("No single removal fixes it — likely a combination of fields or a missing field.")
-
-                            if st.button(
-                                f"🧪 Minimal test (no exotic fields) {label}",
-                                key=f"minimal_{compare_state_key}_{hi}",
-                                help="Removes handling_codes/dimension/other_customs_information/unit_of_measures/remarks/slac_pieces together and retries; if it works, adds them back one at a time.",
-                            ):
-                                ic = ICargoIBSClient()
-                                with st.spinner("Testing minimal payload..."):
-                                    ok, msg, minimal = _test_minimal_hawb_payload(ic, awb_for_icargo, dict(raw_icargo_hawb))
-                                if ok:
-                                    st.success(f"✅ {msg}")
-                                    with st.spinner("Re-adding exotic fields one at a time..."):
-                                        readd_results = _readd_exotic_fields_one_by_one(ic, awb_for_icargo, dict(raw_icargo_hawb), minimal)
-                                    st.dataframe(
-                                        [{"readded_field": k, "result": "OK" if ok2 else "failed", "detail": m} for k, ok2, m in readd_results],
-                                        width='stretch',
-                                    )
-                                else:
-                                    st.error(f"Minimal payload failed too: {msg}")
+                                        st.error(f"Minimal payload test failed: {msg}")
 
                         hawb_edited_rows = _to_records(edited_hawb)
                         selected_fields = _selected_fields_from_rows(hawb_edited_rows)
@@ -1994,7 +2012,7 @@ def render_pdf_upload(on_back):
                                 "raw_icargo_hawb": rec.get("icargo_hawb_data"),
                             })
 
-                with st.expander("🧪 HAWB diagnostic panel", expanded=False):
+                with st.expander("HAWB match diagnostics", expanded=False):
                     st.dataframe(compare_data.get("match_debug_rows", []), width='stretch')
 
                 mawb_edited_rows = _to_records(edited_mawb)
@@ -2003,11 +2021,11 @@ def render_pdf_upload(on_back):
 
                 col_m, col_h, col_all = st.columns(3)
                 with col_m:
-                    update_master_btn = st.button("📝 Update Master", key=f"upd_master_{compare_state_key}")
+                    update_master_btn = st.button("Update Master", key=f"upd_master_{compare_state_key}", width="stretch")
                 with col_h:
-                    update_house_btn = st.button("🏠 Update House", key=f"upd_house_{compare_state_key}")
+                    update_house_btn = st.button("Update House", key=f"upd_house_{compare_state_key}", width="stretch")
                 with col_all:
-                    update_all_btn = st.button("🚀 Update All", key=f"upd_all_{compare_state_key}", type="primary")
+                    update_all_btn = st.button("Update Selected", key=f"upd_all_{compare_state_key}", type="primary", width="stretch")
 
                 def _do_update_master() -> bool:
                     if not selected_mawb_fields:
@@ -2060,11 +2078,11 @@ def render_pdf_upload(on_back):
                     st.error(f"iCargo update error: {e}")
     # ── Batch download ─────────────────────────────────────────────────────
     st.divider()
-    st.subheader("📥 Batch download")
+    st.subheader("Batch Download")
 
     all_json = json.dumps(results, indent=2, default=str)
     st.download_button(
-        label="⬇️ Download all (JSON)",
+        label="Download all JSON",
         data=all_json,
         file_name=f"awbs_batch_{len(results)}.json",
         mime="application/json",
@@ -2082,7 +2100,7 @@ def render_pdf_upload(on_back):
             flat_rows.append(row)
         df = pd.DataFrame(flat_rows)
         st.download_button(
-            label="⬇️ Download MAWB summary (CSV)",
+            label="Download MAWB summary CSV",
             data=df.to_csv(index=False),
             file_name=f"awbs_batch_{len(results)}.csv",
             mime="text/csv",

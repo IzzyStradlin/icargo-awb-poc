@@ -143,7 +143,16 @@ This behavior was introduced to align with observed preprod/stage gateway behavi
 - House payload is built per selected HAWB candidate.
 - For `icargo_only` House rows, source data is seeded from iCargo mapping so updates are possible even without PDF-origin House data.
 
-### 6.4 Consistency rule handling
+### 6.4 ULD payload sanitization
+
+Before the Master AWB POST, the payload is recursively sanitized for ULD sections:
+
+- A field whose name starts with `uld` and contains only empty, null, false, or zero values is sent as an empty collection (`[]` or `{}` according to its original shape).
+- A ULD section that contains a meaningful value, such as a ULD identifier, is preserved unchanged.
+
+This prevents iCargo from interpreting default zero-value ULD entries as real ULD data and rejecting the request with `Invalid ULD`.
+
+### 6.5 Consistency rule handling
 
 To avoid `ICO_AWB_009`:
 
@@ -175,6 +184,16 @@ This supports API behavior testing even when a field is absent from extracted PD
 - matched: PDF House paired to iCargo House by normalized number scoring.
 - pdf_only: extracted House without iCargo counterpart.
 - icargo_only: House existing only in iCargo, now editable and updatable through the same UI.
+
+### 7.4 Results workflow and action hierarchy
+
+The results page follows the operational sequence: review extracted data, compare with iCargo, select fields, then update.
+
+- Each MAWB is an expandable result; its HAWBs are collapsed by default to keep multi-House documents scannable.
+- Re-extraction and JSON download are grouped as secondary actions.
+- `Compare with iCargo` is the primary comparison action.
+- `Update Master`, `Update House`, and `Update Selected` are grouped after the editable diff grids.
+- HAWB round-trip, field-bisection, minimal-payload, raw-response, and match diagnostics are available in collapsed diagnostic panels rather than in the main update path.
 
 ---
 

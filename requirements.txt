@@ -14,6 +14,9 @@ pymupdf
 httpx
 tenacity
 
+folium
+streamlit-folium
+
 beautifulsoup4
 lxml
 

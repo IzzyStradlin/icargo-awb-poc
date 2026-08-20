@@ -130,13 +130,13 @@ div[data-testid="stAlert"] {{
 .stButton > button[kind="primary"],
 .stButton > button[kind="primaryFormSubmit"],
 .stDownloadButton > button {{
-    min-height: 46px;
+    min-height: 38px;
     border: 1px solid var(--msc-black) !important;
     background: var(--msc-black) !important;
     color: var(--msc-white) !important;
     font-weight: 700;
     letter-spacing: 0.01em;
-    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.12);
+    box-shadow: none;
     transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
 }}
 
@@ -254,6 +254,39 @@ div[data-testid="stAlert"] {{
     background: rgba(255, 255, 255, 0.92) !important;
     color: var(--msc-ink) !important;
     border: 1px solid var(--msc-line) !important;
+}}
+
+/* Compact operational views: dense controls, legible tables, restrained framing. */
+.stExpander {{
+    border: 1px solid var(--msc-line) !important;
+    border-radius: 8px !important;
+    background: rgba(255, 255, 255, 0.88) !important;
+}}
+
+.stExpander summary {{
+    font-weight: 700;
+}}
+
+[data-testid="stDataFrame"],
+[data-testid="stDataEditor"] {{
+    border: 1px solid var(--msc-line);
+    border-radius: 8px;
+    overflow: hidden;
+}}
+
+[data-testid="stMetric"] {{
+    padding: 0.35rem 0.15rem;
+}}
+
+[data-testid="stMetricLabel"] {{
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}}
+
+[data-testid="stMetricValue"] {{
+    font-size: 1.1rem;
 }}
 
 h1, h2, h3, h4, h5, h6, p, li, label, span {{
